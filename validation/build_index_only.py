@@ -80,25 +80,59 @@ def build_ivf(refs: np.ndarray, labels: np.ndarray) -> dict:
     return z
 
 
-def emit_binary(z: dict, out_path: Path) -> None:
+FLAG_SOA = 0x1
+
+
+def transpose_clusters_soa(vectors_aos: np.ndarray, offsets: np.ndarray) -> np.ndarray:
+    """Per cluster: (N, Dim) → (Dim, N), concatenado em ordem dim-major.
+
+    Acesso: vectors[offsets[c]*Dim + d*N + i] = AoS[offsets[c]+i, d].
+    """
+    out = np.empty_like(vectors_aos.ravel())
+    for c in range(len(offsets) - 1):
+        s = int(offsets[c]); e = int(offsets[c + 1])
+        n = e - s
+        if n == 0:
+            continue
+        block = vectors_aos[s:e]
+        soa = np.ascontiguousarray(block.T)
+        base = s * DIM
+        out[base:base + n * DIM] = soa.ravel()
+    return out.astype(np.int16, copy=False)
+
+
+def emit_binary(z: dict, out_path: Path, soa: bool = True) -> None:
     centroids = np.ascontiguousarray(z["centroids"], dtype=np.float32)
     bbox_min = np.ascontiguousarray(z["bbox_min"], dtype=np.int16)
     bbox_max = np.ascontiguousarray(z["bbox_max"], dtype=np.int16)
     offsets = np.ascontiguousarray(z["offsets"], dtype=np.uint32)
     labels = np.ascontiguousarray(z["labels"], dtype=np.uint8)
-    vectors = np.ascontiguousarray(z["vectors"], dtype=np.int16)
+    vectors_aos = np.ascontiguousarray(z["vectors"], dtype=np.int16).reshape(-1, DIM)
     n_clusters = len(centroids)
-    n_vectors = len(vectors)
+    n_vectors = len(vectors_aos)
 
-    print(f"[emit] {out_path}  n={n_vectors:,}  k={n_clusters}")
+    if soa:
+        print(f"[emit] {out_path}  n={n_vectors:,}  k={n_clusters}  layout=SoA per-cluster")
+        print("[emit] transposing clusters to SoA…")
+        t0 = perf_counter()
+        vectors = transpose_clusters_soa(vectors_aos, offsets)
+        print(f"[emit] transpose em {perf_counter() - t0:.1f}s")
+        version = 2
+        flags = FLAG_SOA
+    else:
+        print(f"[emit] {out_path}  n={n_vectors:,}  k={n_clusters}  layout=AoS")
+        vectors = vectors_aos.ravel()
+        version = 1
+        flags = 0
+
     with out_path.open("wb") as fh:
         fh.write(MAGIC)
-        fh.write(struct.pack("<I", 1))            # version
+        fh.write(struct.pack("<I", version))
         fh.write(struct.pack("<I", n_vectors))
         fh.write(struct.pack("<I", n_clusters))
         fh.write(struct.pack("<I", DIM))
         fh.write(struct.pack("<f", QUANT_SCALE))
-        fh.write(struct.pack("<Q", 0))            # flags
+        fh.write(struct.pack("<Q", flags))
         fh.write(b"\x00" * (HEADER_SIZE - fh.tell()))
 
         for arr in (centroids, bbox_min, bbox_max, offsets, labels, vectors):
@@ -112,11 +146,16 @@ def emit_binary(z: dict, out_path: Path) -> None:
 
 
 def main() -> None:
-    out_path = Path(sys.argv[1]) if len(sys.argv) > 1 else (DATA_DIR / "index.bin")
+    args = sys.argv[1:]
+    soa = True
+    if "--aos" in args:
+        soa = False
+        args = [a for a in args if a != "--aos"]
+    out_path = Path(args[0]) if args else (DATA_DIR / "index.bin")
     refs, labels = load_references()
     z = build_ivf(refs, labels)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    emit_binary(z, out_path)
+    emit_binary(z, out_path, soa=soa)
 
 
 if __name__ == "__main__":

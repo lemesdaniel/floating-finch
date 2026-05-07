@@ -25,8 +25,8 @@ COPY validation/dataset.py validation/build_index_only.py /work/validation/
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
 
-# pipeline: load refs → k-means → emit index.bin
-RUN python validation/build_index_only.py /work/data/index.bin
+# pipeline: load refs → k-means → emit index.bin (AoS v1, formato Nim)
+RUN python validation/build_index_only.py --aos /work/data/index.bin
 
 # ---------- 2) nim-builder ----------
 # Compila o binário da API em Nim com AVX2 + FMA (linux/amd64).

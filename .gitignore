@@ -14,6 +14,10 @@ data/*.npz
 nim/bin/
 nim/nimcache/
 
+# build artefatos Zig
+zig/zig-out/
+zig/.zig-cache/
+
 # artefatos Python
 .ruff_cache/
 .mypy_cache/

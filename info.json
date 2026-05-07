@@ -1,0 +1,10 @@
+{
+    "participants": ["Daniel Lemes (lemesdaniel)"],
+    "social": [
+        "https://github.com/lemesdaniel",
+        "https://x.com/dlemesdev"
+    ],
+    "source-code-repo": "https://github.com/lemesdaniel/floating-finch",
+    "stack": ["nim", "python", "nginx", "docker"],
+    "open_to_work": false
+}

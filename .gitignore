@@ -1,0 +1,20 @@
+.venv/
+__pycache__/
+*.pyc
+.python-version
+
+# dataset (baixado em runtime; não versionar)
+data/*.json
+data/*.json.gz
+data/*.csv
+data/*.bin
+data/*.npz
+
+# build artefatos Nim
+nim/bin/
+nim/nimcache/
+
+# artefatos Python
+.ruff_cache/
+.mypy_cache/
+.pytest_cache/

@@ -1,0 +1,11 @@
+[project]
+name = "floating-finch"
+version = "0.1.0"
+description = "Rinha de Backend 2026 — Validações Python antes da v1 Nim"
+requires-python = ">=3.11"
+dependencies = [
+    "ijson>=3.5.0",
+    "numpy>=2.4.4",
+    "scikit-learn>=1.8.0",
+    "tqdm>=4.67.3",
+]

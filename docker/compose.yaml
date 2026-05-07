@@ -1,9 +1,6 @@
 services:
   api1: &api
-    build:
-      context: ..
-      dockerfile: docker/Dockerfile
-    image: floating-finch:dev
+    image: ghcr.io/lemesdaniel/floating-finch:v1
     platform: linux/amd64
     networks: [backend]
     environment:

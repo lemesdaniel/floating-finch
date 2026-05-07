@@ -53,6 +53,10 @@ RUN nim c \
 # ---------- 3) runtime ----------
 FROM --platform=linux/amd64 debian:bookworm-slim AS runtime
 
+LABEL org.opencontainers.image.source="https://github.com/lemesdaniel/floating-finch"
+LABEL org.opencontainers.image.description="Rinha de Backend 2026 — fraud detection via vector search (Nim + IVF k-means)"
+LABEL org.opencontainers.image.licenses="MIT"
+
 WORKDIR /app
 
 COPY --from=nim-builder /work/floating_finch /app/floating_finch

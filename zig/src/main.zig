@@ -1,34 +1,22 @@
-//! Servidor HTTP single-thread, Connection: close por request.
-//!
-//! Modelo simples (proof-of-concept didático):
-//!   - 1 thread, accept blocking
-//!   - Cada conn processa 1 request, responde com Connection: close, fecha
-//!   - Nginx mantém pool no lado dele; criar TCP nova é o overhead aceito
-//!     em troca de evitar o deadlock do read blocking single-thread.
-//!
-//! Para maior performance seria necessário epoll edge-triggered ou multi-
-//! threading com SO_REUSEPORT — fora do escopo desta v2 Zig de aprendizado.
+//! HTTP server usando httpz (multi-thread, keep-alive eficiente).
 //!
 //! Endpoints:
 //!   GET  /ready        → 204 No Content
 //!   POST /fraud-score  → 200 application/json (resposta pré-formatada)
 
 const std = @import("std");
+const httpz = @import("httpz");
+
 const types = @import("types.zig");
 const ivf = @import("ivf.zig");
 const search = @import("search.zig");
 const vectorize = @import("vectorize.zig");
 const quantize = @import("quantize.zig");
 
-const ResponseReady = "HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-const ResponseNotFound = "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-const ResponseBadRequest = "HTTP/1.1 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-const ResponseTooLarge = "HTTP/1.1 413 Payload Too Large\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-
-const FraudHeaderTpl = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n";
-
-const MaxBody: usize = 64 * 1024;
-const ReadBufSize: usize = 96 * 1024;
+const App = struct {
+    index: *const ivf.IvfIndex,
+    cfg: search.SearchConfig,
+};
 
 const Config = struct {
     bind_host: []const u8,
@@ -69,167 +57,33 @@ fn loadConfig() Config {
     };
 }
 
-const HttpRequest = struct {
-    method: []const u8,
-    path: []const u8,
-    body: []const u8,
-    keep_alive: bool,
-};
-
-const HttpParseError = error{ Incomplete, BadRequest, TooLarge };
-
-fn asciiEqlIgn(a: []const u8, b: []const u8) bool {
-    if (a.len != b.len) return false;
-    for (a, b) |ca, cb| {
-        const la = if (ca >= 'A' and ca <= 'Z') ca + 32 else ca;
-        const lb = if (cb >= 'A' and cb <= 'Z') cb + 32 else cb;
-        if (la != lb) return false;
-    }
-    return true;
+fn handleReady(_: *App, _: *httpz.Request, res: *httpz.Response) !void {
+    res.status = 204;
 }
 
-fn parseRequest(buf: []const u8) !struct { req: HttpRequest, consumed: usize } {
-    const head_end = std.mem.indexOf(u8, buf, "\r\n\r\n") orelse return error.Incomplete;
-    const head = buf[0..head_end];
-
-    const first_eol = std.mem.indexOfScalar(u8, head, '\n') orelse return error.BadRequest;
-    const first_line_raw = head[0..first_eol];
-    const first_line = if (first_line_raw.len > 0 and first_line_raw[first_line_raw.len - 1] == '\r')
-        first_line_raw[0 .. first_line_raw.len - 1]
-    else
-        first_line_raw;
-
-    const sp1 = std.mem.indexOfScalar(u8, first_line, ' ') orelse return error.BadRequest;
-    const method = first_line[0..sp1];
-    const rest = first_line[sp1 + 1 ..];
-    const sp2 = std.mem.indexOfScalar(u8, rest, ' ') orelse return error.BadRequest;
-    const path = rest[0..sp2];
-
-    var content_length: usize = 0;
-    var keep_alive: bool = true;
-    var line_start: usize = first_eol + 1;
-    while (line_start < head.len) {
-        const eol = std.mem.indexOfScalarPos(u8, head, line_start, '\n') orelse head.len;
-        const line_raw = head[line_start..eol];
-        const line = if (line_raw.len > 0 and line_raw[line_raw.len - 1] == '\r')
-            line_raw[0 .. line_raw.len - 1]
-        else
-            line_raw;
-        if (line.len == 0) break;
-
-        const colon = std.mem.indexOfScalar(u8, line, ':') orelse {
-            line_start = eol + 1;
-            continue;
-        };
-        const name = line[0..colon];
-        var val_start: usize = colon + 1;
-        while (val_start < line.len and (line[val_start] == ' ' or line[val_start] == '\t'))
-            val_start += 1;
-        const value = line[val_start..];
-
-        if (asciiEqlIgn(name, "content-length")) {
-            content_length = std.fmt.parseUnsigned(usize, value, 10) catch return error.BadRequest;
-        } else if (asciiEqlIgn(name, "connection")) {
-            if (asciiEqlIgn(value, "close")) keep_alive = false;
-        }
-
-        line_start = eol + 1;
-    }
-
-    if (content_length > MaxBody) return error.TooLarge;
-
-    const body_start = head_end + 4;
-    const total = body_start + content_length;
-    if (total > buf.len) return error.Incomplete;
-
-    return .{
-        .req = .{
-            .method = method,
-            .path = path,
-            .body = buf[body_start..total],
-            .keep_alive = keep_alive,
-        },
-        .consumed = total,
+fn handleFraud(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
+    const body = req.body() orelse {
+        res.status = 400;
+        return;
     };
-}
 
-const HandlerCtx = struct {
-    index: *const ivf.IvfIndex,
-    cfg: search.SearchConfig,
-    arena: *std.heap.ArenaAllocator,
-};
-
-fn handle(ctx: *HandlerCtx, req: HttpRequest, stream: std.net.Stream) !void {
-    if (std.mem.eql(u8, req.method, "GET") and std.mem.eql(u8, req.path, "/ready")) {
-        try stream.writeAll(ResponseReady);
-        return;
+    var fc: u8 = 0;
+    if (vectorize.vectorizeBody(body, res.arena)) |qF| {
+        const qI = quantize.quantizeQuery(qF);
+        fc = search.fraudCount(app.index, qF, qI, app.cfg);
+    } else |_| {
+        fc = 0;
     }
-    if (std.mem.eql(u8, req.method, "POST") and std.mem.eql(u8, req.path, "/fraud-score")) {
-        _ = ctx.arena.reset(.retain_capacity);
-        const alloc = ctx.arena.allocator();
 
-        var fc: u8 = 0;
-        if (vectorize.vectorizeBody(req.body, alloc)) |qF| {
-            const qI = quantize.quantizeQuery(qF);
-            fc = search.fraudCount(ctx.index, qF, qI, ctx.cfg);
-        } else |_| {
-            fc = 0;
-        }
-
-        if (fc > 5) fc = 0;
-        const body = types.ResponseByFraudCount[fc];
-        var hdr_buf: [128]u8 = undefined;
-        const hdr = try std.fmt.bufPrint(&hdr_buf, FraudHeaderTpl, .{body.len});
-        try stream.writeAll(hdr);
-        try stream.writeAll(body);
-        return;
-    }
-    try stream.writeAll(ResponseNotFound);
-}
-
-fn serve(listener: *std.net.Server, ctx: *HandlerCtx) !void {
-    var read_buf: [ReadBufSize]u8 = undefined;
-    while (true) {
-        var conn = listener.accept() catch |e| {
-            std.log.warn("accept failed: {s}", .{@errorName(e)});
-            continue;
-        };
-        defer conn.stream.close();
-
-        var have: usize = 0;
-        while (true) {
-            const ok = parseRequest(read_buf[0..have]) catch |e| switch (e) {
-                error.Incomplete => null,
-                error.BadRequest => {
-                    _ = conn.stream.writeAll(ResponseBadRequest) catch {};
-                    break;
-                },
-                error.TooLarge => {
-                    _ = conn.stream.writeAll(ResponseTooLarge) catch {};
-                    break;
-                },
-            };
-            if (ok) |parsed| {
-                handle(ctx, parsed.req, conn.stream) catch {};
-                break;
-            }
-            if (have >= read_buf.len) {
-                _ = conn.stream.writeAll(ResponseTooLarge) catch {};
-                break;
-            }
-            const n = conn.stream.read(read_buf[have..]) catch break;
-            if (n == 0) break;
-            have += n;
-        }
-    }
+    if (fc > 5) fc = 0;
+    res.status = 200;
+    res.content_type = .JSON;
+    res.body = types.ResponseByFraudCount[fc];
 }
 
 pub fn main() !void {
     const cfg = loadConfig();
-    const gpa = std.heap.c_allocator;
-
-    var arena = std.heap.ArenaAllocator.init(gpa);
-    defer arena.deinit();
+    const allocator = std.heap.c_allocator;
 
     std.log.info("loading index from {s}", .{cfg.index_path});
     var idx = try ivf.loadIndex(cfg.index_path);
@@ -239,17 +93,30 @@ pub fn main() !void {
         cfg.search.nprobe, cfg.search.bbox_repair, cfg.search.repair_min, cfg.search.repair_max,
     });
 
-    const addr = try std.net.Address.parseIp(cfg.bind_host, cfg.bind_port);
-    var listener = try addr.listen(.{ .reuse_address = true });
-    defer listener.deinit();
-    std.log.info("listening on {s}:{d}  (single-threaded, conn close per request)", .{
-        cfg.bind_host, cfg.bind_port,
-    });
+    var app = App{ .index = &idx, .cfg = cfg.search };
 
-    var ctx = HandlerCtx{
-        .index = &idx,
-        .cfg = cfg.search,
-        .arena = &arena,
-    };
-    try serve(&listener, &ctx);
+    var server = try httpz.Server(*App).init(allocator, .{
+        .address = .{ .ip = .{ .host = cfg.bind_host, .port = cfg.bind_port } },
+        .request = .{
+            .max_body_size = 64 * 1024,
+        },
+        .thread_pool = .{
+            // 3 workers = sweet spot empírico sob 0.40 CPU/container.
+            // 1: p99 9.6ms / 2: p99 4.1ms / 3: p99 3.1ms / 4: p99 15.7ms (thrashing).
+            .count = 3,
+            .buffer_size = 64 * 1024,
+        },
+        .workers = .{
+            .count = 1,
+        },
+    }, &app);
+    defer server.deinit();
+    defer server.stop();
+
+    var router = try server.router(.{});
+    router.get("/ready", handleReady, .{});
+    router.post("/fraud-score", handleFraud, .{});
+
+    std.log.info("listening on {s}:{d}", .{ cfg.bind_host, cfg.bind_port });
+    try server.listen();
 }

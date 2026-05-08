@@ -6,7 +6,7 @@ services:
     environment:
       INDEX_PATH: /app/data/index.bin
       BIND_PORT: "8080"
-      IVF_NPROBE: "4"
+      IVF_NPROBE: "2"
       IVF_BBOX_REPAIR: "true"
       IVF_REPAIR_MIN: "1"
       IVF_REPAIR_MAX: "4"
@@ -22,7 +22,7 @@ services:
     environment:
       INDEX_PATH: /app/data/index.bin
       BIND_PORT: "8080"
-      IVF_NPROBE: "4"
+      IVF_NPROBE: "2"
       IVF_BBOX_REPAIR: "true"
       IVF_REPAIR_MIN: "1"
       IVF_REPAIR_MAX: "4"

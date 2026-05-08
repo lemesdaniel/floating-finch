@@ -1,6 +1,6 @@
 services:
   api1: &api
-    image: ghcr.io/lemesdaniel/floating-finch:v3
+    image: ghcr.io/lemesdaniel/floating-finch:v4
     platform: linux/amd64
     networks: [backend]
     environment:
@@ -8,8 +8,8 @@ services:
       BIND_PORT: "8080"
       IVF_NPROBE: "4"
       IVF_BBOX_REPAIR: "true"
-      IVF_REPAIR_MIN: "1"
-      IVF_REPAIR_MAX: "4"
+      IVF_REPAIR_MIN: "2"
+      IVF_REPAIR_MAX: "3"
       WORKER_THREADS: "2"
     deploy:
       resources:
@@ -24,8 +24,8 @@ services:
       BIND_PORT: "8080"
       IVF_NPROBE: "4"
       IVF_BBOX_REPAIR: "true"
-      IVF_REPAIR_MIN: "1"
-      IVF_REPAIR_MAX: "4"
+      IVF_REPAIR_MIN: "2"
+      IVF_REPAIR_MAX: "3"
       WORKER_THREADS: "2"
 
   nginx:

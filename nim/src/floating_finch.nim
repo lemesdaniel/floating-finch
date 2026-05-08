@@ -14,7 +14,7 @@
 ##   IVF_REPAIR_MIN     → default 2
 ##   IVF_REPAIR_MAX     → default 3
 
-import std/[os, parseutils, strformat, strutils]
+import std/[os, parseutils, strformat, strutils, times]
 
 import mummy, mummy/routers
 
@@ -88,6 +88,10 @@ proc main() =
   echo &"  n={state.index.nVectors}  k={state.index.nClusters}"
   echo &"  config: nprobe={state.config.nprobe}  bboxRepair={state.config.bboxRepair}  " &
        &"repair=[{state.config.repairMin}-{state.config.repairMax}]"
+  echo "  warming up mmap pages…"
+  let t0 = epochTime()
+  warmup(state.index)
+  echo &"  warmup done in {(epochTime() - t0) * 1000:.0f} ms"
 
   var router: Router
   router.get("/ready", handleReady)

@@ -91,6 +91,31 @@ proc loadIndex*(path: string): IvfIndex =
   result.vectors = cast[ptr UncheckedArray[int16]](addr base[vOff])
 
 
+proc warmup*(idx: IvfIndex) =
+  ## Toca todas as páginas dos blocos quentes pra forçar mmap a populá-las
+  ## antes do servidor responder /ready. Evita page faults nos primeiros
+  ## requests do k6 e estabiliza p99.
+  ##
+  ## Usa volatile load pra impedir o compilador de otimizar fora.
+  var sink: int = 0
+  let pageSize = 4096
+  proc touchBytes[T](p: ptr UncheckedArray[T], nElems: int, sink: var int) =
+    let totalBytes = nElems * sizeof(T)
+    let bytePtr = cast[ptr UncheckedArray[byte]](p)
+    var offset = 0
+    while offset < totalBytes:
+      sink = sink xor int(bytePtr[offset])
+      offset += pageSize
+  touchBytes(idx.centroids, idx.nClusters * Dim, sink)
+  touchBytes(idx.bboxMin,   idx.nClusters * Dim, sink)
+  touchBytes(idx.bboxMax,   idx.nClusters * Dim, sink)
+  touchBytes(idx.offsets,   idx.nClusters + 1, sink)
+  touchBytes(idx.labels,    idx.nVectors, sink)
+  touchBytes(idx.vectors,   idx.nVectors * Dim, sink)
+  # impede dead-code elimination
+  if sink == int.high: echo "warmup sink=", sink
+
+
 proc closeIndex*(index: var IvfIndex) =
   if index.file.mem != nil:
     index.file.close()

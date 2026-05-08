@@ -1,6 +1,6 @@
 services:
   api1: &api
-    image: ghcr.io/lemesdaniel/floating-finch:v2
+    image: ghcr.io/lemesdaniel/floating-finch:v3
     platform: linux/amd64
     networks: [backend]
     environment:
@@ -10,6 +10,7 @@ services:
       IVF_BBOX_REPAIR: "true"
       IVF_REPAIR_MIN: "1"
       IVF_REPAIR_MAX: "4"
+      WORKER_THREADS: "2"
     deploy:
       resources:
         limits:
@@ -25,6 +26,7 @@ services:
       IVF_BBOX_REPAIR: "true"
       IVF_REPAIR_MIN: "1"
       IVF_REPAIR_MAX: "4"
+      WORKER_THREADS: "2"
 
   nginx:
     image: nginx:1.27-alpine

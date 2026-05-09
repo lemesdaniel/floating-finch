@@ -1,0 +1,96 @@
+# syntax=docker/dockerfile:1.7
+# v7 PGO: build instrumented → roda bench_profile 50k iters → rebuild com profile-use
+# Esperado: gcc layout/inline tunados pelo hot path real (5-15% speedup típico).
+
+# ---------- 1) preproc-python ----------
+FROM --platform=linux/amd64 python:3.11-slim AS preproc
+
+WORKDIR /work
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl ca-certificates build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+ARG RINHA_DATA_REF=main
+RUN mkdir -p data \
+    && curl -fsSL \
+       "https://raw.githubusercontent.com/zanfranceschi/rinha-de-backend-2026/${RINHA_DATA_REF}/resources/references.json.gz" \
+       -o data/references.json.gz \
+    && curl -fsSL \
+       "https://raw.githubusercontent.com/zanfranceschi/rinha-de-backend-2026/${RINHA_DATA_REF}/test/test-data.json" \
+       -o data/test-data.json
+
+RUN pip install --no-cache-dir numpy scikit-learn ijson tqdm
+
+COPY validation/dataset.py validation/build_index_only.py /work/validation/
+
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+
+RUN python validation/build_index_only.py /work/data/index.bin
+
+# Extract first 5k payloads from official test-data for PGO workload
+RUN python -c "import json; d=json.load(open('data/test-data.json')); \
+    f=open('/work/data/payloads_pgo.jsonl','w'); \
+    [f.write(json.dumps(e['request'])+'\n') for e in d['entries'][:5000]]"
+
+# ---------- 2) nim-pgo (instrumented + workload + final build) ----------
+FROM --platform=linux/amd64 nimlang/nim:2.2.10 AS nim-builder
+
+WORKDIR /work
+
+COPY nim/floating_finch.nimble /work/
+RUN nimble install -y mummy jsony
+
+COPY nim/src /work/src
+COPY --from=preproc /work/data/index.bin /work/data/index.bin
+COPY --from=preproc /work/data/payloads_pgo.jsonl /work/data/payloads_pgo.jsonl
+
+RUN mkdir -p /work/pgo /work/cache
+
+# Build INSTRUMENTED bench_profile (gera .gcno + .gcda no /work/pgo)
+RUN nim c \
+    --nimcache:/work/cache \
+    -d:release \
+    --opt:speed \
+    --mm:arc \
+    --passC:"-O3 -mavx2 -mfma -fno-strict-aliasing -fprofile-generate -fprofile-dir=/work/pgo" \
+    --passL:"-O3 -fprofile-generate -fprofile-dir=/work/pgo" \
+    -o:/work/bench_profile_pgo src/bench_profile.nim
+
+# Roda workload 50k iters → popula /work/pgo com .gcda
+RUN /work/bench_profile_pgo /work/data/index.bin /work/data/payloads_pgo.jsonl 50000
+
+RUN ls /work/pgo | head -20
+
+# Rebuild final com -fprofile-use (limpa cache pra forçar recompile)
+RUN rm -rf /work/cache && mkdir -p /work/cache
+
+RUN nim c \
+    --nimcache:/work/cache \
+    -d:release \
+    -d:lto \
+    --opt:speed \
+    --mm:arc \
+    --passC:"-O3 -mavx2 -mfma -fno-strict-aliasing -fprofile-use -fprofile-dir=/work/pgo -fprofile-correction" \
+    --passL:"-O3 -fprofile-use -fprofile-dir=/work/pgo" \
+    -o:/work/floating_finch src/floating_finch.nim
+
+# ---------- 3) runtime ----------
+FROM --platform=linux/amd64 debian:bookworm-slim AS runtime
+
+LABEL org.opencontainers.image.source="https://github.com/lemesdaniel/floating-finch"
+LABEL org.opencontainers.image.description="Rinha 2026 — Nim PGO build"
+LABEL org.opencontainers.image.licenses="MIT"
+
+WORKDIR /app
+
+COPY --from=nim-builder /work/floating_finch /app/floating_finch
+COPY --from=preproc /work/data/index.bin /app/data/index.bin
+
+ENV INDEX_PATH=/app/data/index.bin
+ENV BIND_HOST=0.0.0.0
+ENV BIND_PORT=8080
+
+EXPOSE 8080
+
+ENTRYPOINT ["/app/floating_finch"]

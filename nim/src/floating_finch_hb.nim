@@ -76,19 +76,17 @@ proc main() =
   sharedState = stRef
   echo &"  n={sharedState.index.nVectors}  k={sharedState.index.nClusters}"
   echo &"  config: nprobe={sharedState.config.nprobe}  repair=[{sharedState.config.repairMin}-{sharedState.config.repairMax}]"
-  echo "  warming up mmap pages…"
-  let t0 = epochTime()
-  warmup(sharedState.index)
-  echo &"  warmup done in {(epochTime() - t0) * 1000:.0f} ms"
+  # Sem warmup explícito: httpbeast só chama listen() em run(), warmup atrasaria
+  # bind e estoura health-check timeout do harness em discos lentos (Mac Mini SATA).
+  # Páginas serão paginadas naturalmente pelos primeiros requests do k6 ramp-up.
 
   let host = envOr("BIND_HOST", "0.0.0.0")
   let port = envInt("BIND_PORT", 8080)
-  let workers = envInt("WORKER_THREADS", 1)
+  let workers = envInt("WORKER_THREADS", 2)
   echo &"listening on {host}:{port} (httpbeast workers={workers})"
 
   let settings = initSettings(
     port = Port(port),
-    bindAddr = host,
     numThreads = workers,
   )
   run(onRequest, settings)

@@ -1,6 +1,6 @@
 services:
   api1: &api
-    image: ghcr.io/lemesdaniel/floating-finch:v6
+    image: ghcr.io/lemesdaniel/floating-finch:v4
     platform: linux/amd64
     networks: [backend]
     environment:

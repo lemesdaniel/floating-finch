@@ -53,10 +53,12 @@ proc loadIndex*(path: string): IvfIndex =
   let header = cast[ptr IvfHeader](addr base[0])
   if header.magic != MagicExpected:
     raise newException(IOError, &"{path}: magic inesperado")
-  if header.version != 1:
-    raise newException(IOError, &"{path}: versão {header.version} não suportada")
+  if header.version != 2:
+    raise newException(IOError, &"{path}: versão {header.version} não suportada (esperado v2 SoA)")
   if header.dim != Dim.uint32:
     raise newException(IOError, &"{path}: dim={header.dim} != {Dim}")
+  if (header.flags and 0x1'u64) == 0:
+    raise newException(IOError, &"{path}: flag SoA ausente em arquivo v2")
 
   result.nVectors = int(header.nVectors)
   result.nClusters = int(header.nClusters)

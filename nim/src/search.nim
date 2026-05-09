@@ -16,6 +16,18 @@ import std/math
 import types
 import ivf
 
+{.compile: "c_simd.c".}
+
+proc floating_finch_dists_soa_avx2(vec_soa: ptr int16, n: int32,
+                                   q: ptr int16, dists_out: ptr int64)
+                                   {.importc, cdecl.}
+
+const MaxClusterBuf = 16384
+  ## Buffer thread-local para distâncias batch de um cluster. n=3M / k=2048
+  ## média ~1465; outliers de até ~10× ainda cabem com folga.
+
+var distsBuf {.threadvar.}: array[MaxClusterBuf, int64]
+
 type
   SearchConfig* = object
     nprobe*: int
@@ -66,6 +78,19 @@ proc squaredDistanceI16(refRow: ptr UncheckedArray[int16], q: QueryI16): int64 {
   s
 
 
+proc squaredDistanceCappedI16(refRow: ptr UncheckedArray[int16], q: QueryI16,
+                              threshold: int64): int64 {.inline.} =
+  ## Versão com early break: aborta soma assim que `s >= threshold`. Retorna
+  ## o valor parcial (que >= threshold), suficiente para o tryInsert recusar.
+  var s: int64 = 0
+  for d in 0 ..< Dim:
+    let diff = int32(refRow[d]) - int32(q[d])
+    s += int64(diff) * int64(diff)
+    if s >= threshold:
+      return s
+  s
+
+
 proc squaredCentroidDistance(idx: IvfIndex, c: int, q: QueryF32): float32 {.inline.} =
   let base = c * Dim
   var s: float32 = 0
@@ -90,6 +115,26 @@ proc bboxMinSqDistance(idx: IvfIndex, c: int, q: QueryI16): int64 {.inline.} =
       else: 0
     s += int64(delta) * int64(delta)
   s
+
+
+proc bboxBelowThreshold(idx: IvfIndex, c: int, q: QueryI16, threshold: int64): bool {.inline.} =
+  ## Mesma semântica de `bboxMinSqDistance(c) < threshold`, mas com early break.
+  ## Para clusters distantes (típico no repair scan), retorna falso após ~3-4 dims
+  ## em vez de 14, reduzindo o custo total do repair em ~3-4×.
+  let base = c * Dim
+  var s: int64 = 0
+  for d in 0 ..< Dim:
+    let qv = int32(q[d])
+    let lo = int32(idx.bboxMin[base + d])
+    let hi = int32(idx.bboxMax[base + d])
+    let delta =
+      if qv < lo: lo - qv
+      elif qv > hi: qv - hi
+      else: 0
+    s += int64(delta) * int64(delta)
+    if s >= threshold:
+      return false
+  true
 
 
 proc nearestCentroids(idx: IvfIndex, q: QueryF32, nprobe: int, out_buf: var openArray[int]) =
@@ -117,10 +162,14 @@ proc nearestCentroids(idx: IvfIndex, q: QueryF32, nprobe: int, out_buf: var open
 proc searchCluster(idx: IvfIndex, c: int, q: QueryI16, top: var Top5) {.inline.} =
   let s = int(idx.offsets[c])
   let e = int(idx.offsets[c + 1])
-  for r in s ..< e:
-    let row = cast[ptr UncheckedArray[int16]](addr idx.vectors[r * Dim])
-    let d = squaredDistanceI16(row, q)
-    tryInsert(top, d, idx.labels[r])
+  let n = e - s
+  if n == 0: return
+  assert n <= MaxClusterBuf, "cluster excede MaxClusterBuf"
+  let blockPtr = addr idx.vectors[s * Dim]
+  let qPtr = unsafeAddr q[0]
+  floating_finch_dists_soa_avx2(blockPtr, int32(n), qPtr, addr distsBuf[0])
+  for r in 0 ..< n:
+    tryInsert(top, distsBuf[r], idx.labels[s + r])
 
 
 proc fraudCount*(idx: IvfIndex, qF: QueryF32, qI: QueryI16, cfg: SearchConfig): uint8 =
@@ -145,7 +194,7 @@ proc fraudCount*(idx: IvfIndex, qF: QueryF32, qI: QueryI16, cfg: SearchConfig): 
           alreadyProbed = true
           break
       if alreadyProbed: continue
-      if bboxMinSqDistance(idx, c, qI) >= threshold: continue
+      if not bboxBelowThreshold(idx, c, qI, threshold): continue
       searchCluster(idx, c, qI, top)
     fraud = 0
     for l in top.labels:

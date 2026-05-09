@@ -55,6 +55,12 @@ proc loadConfig(): SearchConfig =
   result.repairMax = envInt("IVF_REPAIR_MAX", 4)
 
 
+proc envWorkers(): int =
+  ## Mummy default = countProcessors() * 10. No Mac Mini 4-core sob 0.40 CPU
+  ## isso vira 40 threads brigando por 0.4 core. Default explícito = 2.
+  envInt("WORKER_THREADS", 2)
+
+
 proc handleReady(req: Request) {.gcsafe.} =
   req.respond(204)
 
@@ -99,8 +105,9 @@ proc main() =
 
   let host = envOr("BIND_HOST", "0.0.0.0")
   let port = envInt("BIND_PORT", 8080)
-  echo &"listening on {host}:{port}"
-  let server = newServer(router)
+  let workers = envWorkers()
+  echo &"listening on {host}:{port}  workers={workers}"
+  let server = newServer(router, workerThreads = workers)
   server.serve(Port(port), host)
 
 

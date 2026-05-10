@@ -21,6 +21,7 @@ const App = struct {
 const Config = struct {
     bind_host: []const u8,
     bind_port: u16,
+    uds_path: []const u8, // se não vazio, listen em UDS
     index_path: []const u8,
     search: search.SearchConfig,
 };
@@ -47,6 +48,7 @@ fn loadConfig() Config {
     return Config{
         .bind_host = envOr("BIND_HOST", "0.0.0.0"),
         .bind_port = @intCast(envU32("BIND_PORT", 8080)),
+        .uds_path = envOr("UDS_PATH", ""),
         .index_path = envOr("INDEX_PATH", "./index.bin"),
         .search = .{
             .nprobe = envU32("IVF_NPROBE", 4),
@@ -95,8 +97,19 @@ pub fn main() !void {
 
     var app = App{ .index = &idx, .cfg = cfg.search };
 
+    // Remove socket UDS pré-existente (de crash anterior) pra evitar EADDRINUSE
+    if (cfg.uds_path.len > 0) {
+        std.fs.deleteFileAbsolute(cfg.uds_path) catch {};
+    }
+
+    const AddrConfig = httpz.Config.AddressConfig;
+    const addr_cfg: AddrConfig = if (cfg.uds_path.len > 0)
+        .{ .unix = cfg.uds_path }
+    else
+        .{ .ip = .{ .host = cfg.bind_host, .port = cfg.bind_port } };
+
     var server = try httpz.Server(*App).init(allocator, .{
-        .address = .{ .ip = .{ .host = cfg.bind_host, .port = cfg.bind_port } },
+        .address = addr_cfg,
         .request = .{
             .max_body_size = 64 * 1024,
         },
@@ -117,6 +130,32 @@ pub fn main() !void {
     router.get("/ready", handleReady, .{});
     router.post("/fraud-score", handleFraud, .{});
 
-    std.log.info("listening on {s}:{d}", .{ cfg.bind_host, cfg.bind_port });
+    if (cfg.uds_path.len > 0) {
+        std.log.info("listening on unix:{s}", .{cfg.uds_path});
+        // chmod 0666 pro nginx (rodando como nginx user) poder conectar
+        // dispatcha em thread paralela porque server.listen() bloqueia
+        const ChmodCtx = struct {
+            fn run(path: []const u8) void {
+                // espera socket ser criado
+                var i: u32 = 0;
+                while (i < 50) : (i += 1) {
+                    std.fs.accessAbsolute(path, .{}) catch {
+                        std.Thread.sleep(20 * std.time.ns_per_ms);
+                        continue;
+                    };
+                    break;
+                }
+                var path_buf: [4096]u8 = undefined;
+                if (path.len >= path_buf.len) return;
+                @memcpy(path_buf[0..path.len], path);
+                path_buf[path.len] = 0;
+                const path_z: [*:0]const u8 = @ptrCast(&path_buf);
+                _ = std.c.chmod(path_z, 0o666);
+            }
+        };
+        _ = try std.Thread.spawn(.{}, ChmodCtx.run, .{cfg.uds_path});
+    } else {
+        std.log.info("listening on {s}:{d}", .{ cfg.bind_host, cfg.bind_port });
+    }
     try server.listen();
 }

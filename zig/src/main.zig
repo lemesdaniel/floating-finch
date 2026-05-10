@@ -13,6 +13,20 @@ const search = @import("search.zig");
 const vectorize = @import("vectorize.zig");
 const quantize = @import("quantize.zig");
 
+// Silencia logs do httpz e qualquer scope em hot path. std.log default escreve
+// em stderr (syscall write) — overhead direto na latência sob carga.
+pub const std_options: std.Options = .{
+    .log_level = .err,
+    .logFn = silentLog,
+};
+
+fn silentLog(
+    comptime _: std.log.Level,
+    comptime _: @Type(.enum_literal),
+    comptime _: []const u8,
+    _: anytype,
+) void {}
+
 const App = struct {
     index: *const ivf.IvfIndex,
     cfg: search.SearchConfig,

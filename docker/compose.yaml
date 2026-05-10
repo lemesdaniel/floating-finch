@@ -1,6 +1,6 @@
 services:
   api1: &api
-    image: ghcr.io/lemesdaniel/floating-finch:v2
+    image: ghcr.io/lemesdaniel/floating-finch:v4
     platform: linux/amd64
     networks: [backend]
     environment:
@@ -10,10 +10,17 @@ services:
       IVF_BBOX_REPAIR: "true"
       IVF_REPAIR_MIN: "1"
       IVF_REPAIR_MAX: "4"
+      WORKER_THREADS: "2"
+    security_opt:
+      - seccomp=unconfined
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
     deploy:
       resources:
         limits:
-          cpus: "0.40"
+          cpus: "0.35"
           memory: "165MB"
 
   api2:
@@ -25,6 +32,7 @@ services:
       IVF_BBOX_REPAIR: "true"
       IVF_REPAIR_MIN: "1"
       IVF_REPAIR_MAX: "4"
+      WORKER_THREADS: "2"
 
   nginx:
     image: nginx:1.27-alpine
@@ -35,10 +43,18 @@ services:
       - "9999:9999"
     volumes:
       - ./nginx.conf:/etc/nginx/nginx.conf:ro
+    security_opt:
+      - seccomp=unconfined
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    sysctls:
+      net.core.somaxconn: 4096
     deploy:
       resources:
         limits:
-          cpus: "0.20"
+          cpus: "0.30"
           memory: "20MB"
 
 networks:

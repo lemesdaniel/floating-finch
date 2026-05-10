@@ -30,9 +30,10 @@ FROM --platform=linux/amd64 nimlang/nim:2.2.10 AS nim-builder
 WORKDIR /work
 
 COPY nim/floating_finch.nimble /work/
-RUN nimble install -y mummy jsony httpbeast
+RUN nimble install -y mummy jsony
 
 COPY nim/src /work/src
+COPY nim/vendor /work/vendor
 
 RUN nim c \
     -d:release \

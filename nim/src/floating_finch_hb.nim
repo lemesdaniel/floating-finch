@@ -3,9 +3,9 @@
 ## Mesma config env do floating_finch.nim. Usa httpbeast pra evitar overhead
 ## do mummy multi-thread sob 0.40 CPU.
 
-import std/[options, os, parseutils, strformat, strutils, times, asyncdispatch, httpcore]
+import std/[net, options, os, parseutils, strformat, strutils, times, asyncdispatch, httpcore]
 
-import httpbeast
+import "../vendor/httpbeast"
 
 import types, ivf, quantize, vectorize, search
 
@@ -82,14 +82,28 @@ proc main() =
 
   let host = envOr("BIND_HOST", "0.0.0.0")
   let port = envInt("BIND_PORT", 8080)
+  let udsPath = envOr("UDS_PATH", "")
   let workers = envInt("WORKER_THREADS", 2)
-  echo &"listening on {host}:{port} (httpbeast workers={workers})"
 
-  let settings = initSettings(
-    port = Port(port),
-    numThreads = workers,
-  )
-  run(onRequest, settings)
+  if udsPath.len > 0:
+    # UDS bind não suporta REUSEPORT efetivamente — múltiplas threads tentando
+    # bind no mesmo path falham. Força 1 thread em UDS mode.
+    echo &"listening on unix:{udsPath} (httpbeast workers=1, UDS)"
+    let settings = initSettings(
+      port = Port(0),
+      bindAddr = udsPath,
+      domain = Domain.AF_UNIX,
+      numThreads = 1,
+      reusePort = false,
+    )
+    run(onRequest, settings)
+  else:
+    echo &"listening on {host}:{port} (httpbeast workers={workers})"
+    let settings = initSettings(
+      port = Port(port),
+      numThreads = workers,
+    )
+    run(onRequest, settings)
 
 
 when isMainModule:

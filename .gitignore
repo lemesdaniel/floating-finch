@@ -17,6 +17,7 @@ nim/nimcache/
 # build artefatos Zig
 zig/zig-out/
 zig/.zig-cache/
+zig/zig-pkg/
 
 # artefatos Python
 .ruff_cache/

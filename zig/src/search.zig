@@ -111,34 +111,52 @@ fn searchCluster(idx: *const ivf.IvfIndex, c: usize, q: types.QueryI16, top: *To
     const n = e - s;
     if (n == 0) return;
 
-    // block points to start of SoA layout for this cluster:
+    // block: ponteiro pro início da region SoA do cluster:
     //   dim0[0..n-1], dim1[0..n-1], ..., dim13[0..n-1]
     const block: [*]const i16 = idx.vectors + s * types.Dim;
 
+    // Query em f32 (cast da query int16 já quantizada).
+    var q_f32: [types.Dim]f32 = undefined;
+    inline for (0..types.Dim) |d| q_f32[d] = @floatFromInt(q[d]);
+
     var i: usize = 0;
     while (i + 8 <= n) : (i += 8) {
-        var totals: [8]i64 = [_]i64{0} ** 8;
-
-        inline for (DimChunks) |chunk| {
-            var acc: @Vector(8, i32) = @splat(0);
-            var d = chunk.start;
-            while (d < chunk.end) : (d += 1) {
-                const slice_ptr = block + @as(usize, d) * n + i;
-                // Unaligned load 8 i16
-                const v_i16: @Vector(8, i16) = slice_ptr[0..8].*;
-                // Sign-extend to i32
-                const v_i32: @Vector(8, i32) = v_i16;
-                const qd_v: @Vector(8, i32) = @splat(@as(i32, q[d]));
-                const diff = v_i32 - qd_v;
-                const sq = diff * diff;
-                acc += sq;
-            }
-            const acc_arr: [8]i32 = acc;
-            inline for (0..8) |j| totals[j] += @as(i64, acc_arr[j]);
+        // Acumula squared diff das primeiras 8 dims em @Vector(8, f32) com FMA
+        var sum_lo: @Vector(8, f32) = @splat(0);
+        inline for (0..8) |d| {
+            const slice_ptr = block + d * n + i;
+            const v_i16: @Vector(8, i16) = slice_ptr[0..8].*;
+            const v_i32: @Vector(8, i32) = v_i16;
+            const v_f32: @Vector(8, f32) = @floatFromInt(v_i32);
+            const q_v: @Vector(8, f32) = @splat(q_f32[d]);
+            const diff = v_f32 - q_v;
+            sum_lo = @mulAdd(@Vector(8, f32), diff, diff, sum_lo);
         }
 
+        // Partial threshold rejection: se TODAS as 8 lanes já passaram a
+        // threshold do worst do top-5, esse bloco não contribui — skip dims 8-13.
+        const thr: f32 = @floatFromInt(top.distances[top.worst]);
+        const thr_v: @Vector(8, f32) = @splat(thr);
+        const lt_mask = sum_lo < thr_v;
+        const any_lt = @reduce(.Or, lt_mask);
+        if (!any_lt) continue;
+
+        // Completa dims 8-13 (6 dims = 3 pares FMA)
+        var sum_hi: @Vector(8, f32) = @splat(0);
+        inline for (8..14) |d| {
+            const slice_ptr = block + d * n + i;
+            const v_i16: @Vector(8, i16) = slice_ptr[0..8].*;
+            const v_i32: @Vector(8, i32) = v_i16;
+            const v_f32: @Vector(8, f32) = @floatFromInt(v_i32);
+            const q_v: @Vector(8, f32) = @splat(q_f32[d]);
+            const diff = v_f32 - q_v;
+            sum_hi = @mulAdd(@Vector(8, f32), diff, diff, sum_hi);
+        }
+
+        const total = sum_lo + sum_hi;
+        const total_arr: [8]f32 = total;
         inline for (0..8) |j| {
-            top.tryInsert(totals[j], idx.labels[s + i + j]);
+            top.tryInsert(@intFromFloat(total_arr[j]), idx.labels[s + i + j]);
         }
     }
 

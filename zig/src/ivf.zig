@@ -53,10 +53,14 @@ pub fn loadIndex(path: []const u8) !IvfIndex {
         null,
         size,
         std.posix.PROT.READ,
-        .{ .TYPE = .SHARED },
+        .{ .TYPE = .SHARED, .POPULATE = true },
         file.handle,
         0,
     );
+
+    // Padrão de acesso aleatório por cluster — instrui kernel a não fazer
+    // read-ahead sequencial agressivo (que pollui cache).
+    std.posix.madvise(mapped.ptr, size, std.posix.MADV.RANDOM) catch {};
 
     const header_ptr: *const Header = @ptrCast(@alignCast(mapped.ptr));
     if (!std.mem.eql(u8, &header_ptr.magic, &Magic)) return error.BadMagic;

@@ -77,6 +77,32 @@ fn handleReady(_: *App, _: *httpz.Request, res: *httpz.Response) !void {
     res.status = 204;
 }
 
+/// Pre-warm aquece caches/predictor. Gera queries pseudo-aleatórias e roda
+/// fraudCount. Resultado é descartado.
+fn prewarmSearch(idx: *const ivf.IvfIndex, cfg: search.SearchConfig, iters: usize) void {
+    var rng = std.Random.DefaultPrng.init(42);
+    const random = rng.random();
+    var i: usize = 0;
+    while (i < iters) : (i += 1) {
+        var qF: types.QueryF32 = undefined;
+        var qI: types.QueryI16 = undefined;
+        inline for (0..types.Dim) |d| {
+            const v = random.float(f32);
+            qF[d] = v;
+            qI[d] = @intFromFloat(v * types.QuantScale);
+        }
+        // Sentinel ocasional nos campos 5,6 pra exercitar code path
+        if (i % 4 == 0) {
+            qF[5] = -1.0;
+            qF[6] = -1.0;
+            qI[5] = -10000;
+            qI[6] = -10000;
+        }
+        const _fc = search.fraudCount(idx, qF, qI, cfg);
+        std.mem.doNotOptimizeAway(_fc);
+    }
+}
+
 fn handleFraud(app: *App, req: *httpz.Request, res: *httpz.Response) !void {
     const body = req.body() orelse {
         res.status = 400;
@@ -108,6 +134,10 @@ pub fn main() !void {
     std.log.info("  config: nprobe={d}  bboxRepair={any}  repair=[{d}-{d}]", .{
         cfg.search.nprobe, cfg.search.bbox_repair, cfg.search.repair_min, cfg.search.repair_max,
     });
+
+    // Pre-warm: aquece I-cache, decoded-uop cache, branch predictor + força page
+    // faults no mmap ANTES do harness começar. ~500 iters cobre todas as paths.
+    prewarmSearch(&idx, cfg.search, 500);
 
     var app = App{ .index = &idx, .cfg = cfg.search };
 

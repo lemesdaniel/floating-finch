@@ -81,6 +81,42 @@ def build_ivf(refs: np.ndarray, labels: np.ndarray) -> dict:
 
 
 FLAG_SOA = 0x1
+FLAG_BLOCKS = 0x4
+
+BLOCK_SIZE = 8
+
+
+def to_block_layout(vectors_aos: np.ndarray, offsets: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """Per cluster: blocos de 8 vetores × Dim dims, com padding i16::MAX.
+
+    Layout dentro do bloco (dim-major):
+        dim0[8 lanes] dim1[8 lanes] ... dim13[8 lanes]  (14 × 8 = 112 i16/bloco)
+
+    Retorna (block_offsets, vectors_blocks).
+    """
+    n_clusters = len(offsets) - 1
+    block_offsets = np.zeros(n_clusters + 1, dtype=np.uint32)
+    blocks_list = []
+    pad_val = np.iinfo(np.int16).max  # 32767
+    for c in range(n_clusters):
+        s, e = int(offsets[c]), int(offsets[c + 1])
+        n_valid = e - s
+        n_blocks = (n_valid + BLOCK_SIZE - 1) // BLOCK_SIZE
+        block_offsets[c + 1] = block_offsets[c] + n_blocks
+        if n_valid == 0:
+            continue
+        padded_n = n_blocks * BLOCK_SIZE
+        padded = np.full((padded_n, DIM), pad_val, dtype=np.int16)
+        padded[:n_valid] = vectors_aos[s:e]
+        # (n_blocks, BLOCK_SIZE, DIM) → (n_blocks, DIM, BLOCK_SIZE) → ravel
+        blocks = padded.reshape(n_blocks, BLOCK_SIZE, DIM).transpose(0, 2, 1)
+        blocks_list.append(blocks.ravel())
+    vectors_blocks = (
+        np.concatenate(blocks_list)
+        if blocks_list
+        else np.array([], dtype=np.int16)
+    )
+    return block_offsets, vectors_blocks
 
 
 def transpose_clusters_soa(vectors_aos: np.ndarray, offsets: np.ndarray) -> np.ndarray:
@@ -101,7 +137,7 @@ def transpose_clusters_soa(vectors_aos: np.ndarray, offsets: np.ndarray) -> np.n
     return out.astype(np.int16, copy=False)
 
 
-def emit_binary(z: dict, out_path: Path, soa: bool = True) -> None:
+def emit_binary(z: dict, out_path: Path, soa: bool = True, blocks: bool = False) -> None:
     centroids = np.ascontiguousarray(z["centroids"], dtype=np.float32)
     bbox_min = np.ascontiguousarray(z["bbox_min"], dtype=np.int16)
     bbox_max = np.ascontiguousarray(z["bbox_max"], dtype=np.int16)
@@ -110,8 +146,18 @@ def emit_binary(z: dict, out_path: Path, soa: bool = True) -> None:
     vectors_aos = np.ascontiguousarray(z["vectors"], dtype=np.int16).reshape(-1, DIM)
     n_clusters = len(centroids)
     n_vectors = len(vectors_aos)
+    block_offsets: np.ndarray | None = None
 
-    if soa:
+    if blocks:
+        print(f"[emit] {out_path}  n={n_vectors:,}  k={n_clusters}  layout=BLOCKS dim-major (BLOCK_SIZE=8)")
+        t0 = perf_counter()
+        block_offsets, vectors = to_block_layout(vectors_aos, offsets)
+        block_offsets = block_offsets.astype(np.uint32, copy=False)
+        total_blocks = int(block_offsets[-1])
+        print(f"[emit] block layout em {perf_counter() - t0:.1f}s  total_blocks={total_blocks:,}")
+        version = 3
+        flags = FLAG_BLOCKS
+    elif soa:
         print(f"[emit] {out_path}  n={n_vectors:,}  k={n_clusters}  layout=SoA per-cluster")
         print("[emit] transposing clusters to SoA…")
         t0 = perf_counter()
@@ -135,7 +181,12 @@ def emit_binary(z: dict, out_path: Path, soa: bool = True) -> None:
         fh.write(struct.pack("<Q", flags))
         fh.write(b"\x00" * (HEADER_SIZE - fh.tell()))
 
-        for arr in (centroids, bbox_min, bbox_max, offsets, labels, vectors):
+        # Ordem dos blocos no arquivo. v3 inclui block_offsets entre offsets e labels.
+        if block_offsets is not None:
+            seq = (centroids, bbox_min, bbox_max, offsets, block_offsets, labels, vectors)
+        else:
+            seq = (centroids, bbox_min, bbox_max, offsets, labels, vectors)
+        for arr in seq:
             pos = fh.tell()
             rem = pos % ALIGN
             if rem:
@@ -148,14 +199,19 @@ def emit_binary(z: dict, out_path: Path, soa: bool = True) -> None:
 def main() -> None:
     args = sys.argv[1:]
     soa = True
+    blocks = False
     if "--aos" in args:
         soa = False
         args = [a for a in args if a != "--aos"]
+    if "--blocks" in args:
+        blocks = True
+        soa = False
+        args = [a for a in args if a != "--blocks"]
     out_path = Path(args[0]) if args else (DATA_DIR / "index.bin")
     refs, labels = load_references()
     z = build_ivf(refs, labels)
     out_path.parent.mkdir(parents=True, exist_ok=True)
-    emit_binary(z, out_path, soa=soa)
+    emit_binary(z, out_path, soa=soa, blocks=blocks)
 
 
 if __name__ == "__main__":

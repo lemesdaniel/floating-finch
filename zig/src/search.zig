@@ -105,23 +105,18 @@ const DimChunks = [_]Chunk{
     .{ .start = 12, .end = 14 },
 };
 
-fn searchCluster(idx: *const ivf.IvfIndex, c: usize, q: types.QueryI16, top: *Top5) void {
+fn searchClusterSoA(idx: *const ivf.IvfIndex, c: usize, q: types.QueryI16, top: *Top5) void {
     const s: usize = idx.offsets[c];
     const e: usize = idx.offsets[c + 1];
     const n = e - s;
     if (n == 0) return;
 
-    // block: ponteiro pro início da region SoA do cluster:
-    //   dim0[0..n-1], dim1[0..n-1], ..., dim13[0..n-1]
     const block: [*]const i16 = idx.vectors + s * types.Dim;
-
-    // Query em f32 (cast da query int16 já quantizada).
     var q_f32: [types.Dim]f32 = undefined;
     inline for (0..types.Dim) |d| q_f32[d] = @floatFromInt(q[d]);
 
     var i: usize = 0;
     while (i + 8 <= n) : (i += 8) {
-        // Acumula squared diff das primeiras 8 dims em @Vector(8, f32) com FMA
         var sum_lo: @Vector(8, f32) = @splat(0);
         inline for (0..8) |d| {
             const slice_ptr = block + d * n + i;
@@ -132,16 +127,11 @@ fn searchCluster(idx: *const ivf.IvfIndex, c: usize, q: types.QueryI16, top: *To
             const diff = v_f32 - q_v;
             sum_lo = @mulAdd(@Vector(8, f32), diff, diff, sum_lo);
         }
-
-        // Partial threshold rejection: se TODAS as 8 lanes já passaram a
-        // threshold do worst do top-5, esse bloco não contribui — skip dims 8-13.
         const thr: f32 = @floatFromInt(top.distances[top.worst]);
         const thr_v: @Vector(8, f32) = @splat(thr);
         const lt_mask = sum_lo < thr_v;
-        const any_lt = @reduce(.Or, lt_mask);
-        if (!any_lt) continue;
+        if (!@reduce(.Or, lt_mask)) continue;
 
-        // Completa dims 8-13 (6 dims = 3 pares FMA)
         var sum_hi: @Vector(8, f32) = @splat(0);
         inline for (8..14) |d| {
             const slice_ptr = block + d * n + i;
@@ -152,7 +142,6 @@ fn searchCluster(idx: *const ivf.IvfIndex, c: usize, q: types.QueryI16, top: *To
             const diff = v_f32 - q_v;
             sum_hi = @mulAdd(@Vector(8, f32), diff, diff, sum_hi);
         }
-
         const total = sum_lo + sum_hi;
         const total_arr: [8]f32 = total;
         inline for (0..8) |j| {
@@ -160,7 +149,6 @@ fn searchCluster(idx: *const ivf.IvfIndex, c: usize, q: types.QueryI16, top: *To
         }
     }
 
-    // Tail escalar
     while (i < n) : (i += 1) {
         var sum: i64 = 0;
         var d: usize = 0;
@@ -171,6 +159,73 @@ fn searchCluster(idx: *const ivf.IvfIndex, c: usize, q: types.QueryI16, top: *To
             sum += @as(i64, diff) * @as(i64, diff);
         }
         top.tryInsert(sum, idx.labels[s + i]);
+    }
+}
+
+fn searchClusterBlocks(idx: *const ivf.IvfIndex, c: usize, q: types.QueryI16, top: *Top5) void {
+    const s: usize = idx.offsets[c];
+    const e: usize = idx.offsets[c + 1];
+    const n_valid = e - s;
+    if (n_valid == 0) return;
+
+    const block_offsets = idx.block_offsets orelse return;
+    const bk_start: usize = block_offsets[c];
+    const bk_end: usize = block_offsets[c + 1];
+    const n_blocks = bk_end - bk_start;
+    if (n_blocks == 0) return;
+
+    var q_f32: [types.Dim]f32 = undefined;
+    inline for (0..types.Dim) |d| q_f32[d] = @floatFromInt(q[d]);
+
+    var bk: usize = 0;
+    while (bk < n_blocks) : (bk += 1) {
+        const block_ptr = idx.vectors + (bk_start + bk) * ivf.BlockStride;
+
+        // dims 0..7 — FMA com acumulador f32×8
+        var sum_lo: @Vector(8, f32) = @splat(0);
+        inline for (0..8) |d| {
+            const slot = block_ptr + d * ivf.BlockSize;
+            const v_i16: @Vector(8, i16) = slot[0..8].*;
+            const v_i32: @Vector(8, i32) = v_i16;
+            const v_f32: @Vector(8, f32) = @floatFromInt(v_i32);
+            const q_v: @Vector(8, f32) = @splat(q_f32[d]);
+            const diff = v_f32 - q_v;
+            sum_lo = @mulAdd(@Vector(8, f32), diff, diff, sum_lo);
+        }
+
+        // Partial threshold rejection
+        const thr: f32 = @floatFromInt(top.distances[top.worst]);
+        const lt_mask = sum_lo < @as(@Vector(8, f32), @splat(thr));
+        if (!@reduce(.Or, lt_mask)) continue;
+
+        // dims 8..13 (6 dims)
+        var sum_hi: @Vector(8, f32) = @splat(0);
+        inline for (8..14) |d| {
+            const slot = block_ptr + d * ivf.BlockSize;
+            const v_i16: @Vector(8, i16) = slot[0..8].*;
+            const v_i32: @Vector(8, i32) = v_i16;
+            const v_f32: @Vector(8, f32) = @floatFromInt(v_i32);
+            const q_v: @Vector(8, f32) = @splat(q_f32[d]);
+            const diff = v_f32 - q_v;
+            sum_hi = @mulAdd(@Vector(8, f32), diff, diff, sum_hi);
+        }
+
+        const total = sum_lo + sum_hi;
+        const total_arr: [8]f32 = total;
+        const base_idx = bk * ivf.BlockSize;
+        const lane_count = @min(@as(usize, ivf.BlockSize), n_valid - base_idx);
+        var j: usize = 0;
+        while (j < lane_count) : (j += 1) {
+            top.tryInsert(@intFromFloat(total_arr[j]), idx.labels[s + base_idx + j]);
+        }
+    }
+}
+
+fn searchCluster(idx: *const ivf.IvfIndex, c: usize, q: types.QueryI16, top: *Top5) void {
+    if (idx.version == 3) {
+        searchClusterBlocks(idx, c, q, top);
+    } else {
+        searchClusterSoA(idx, c, q, top);
     }
 }
 

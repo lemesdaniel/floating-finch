@@ -30,7 +30,7 @@ COPY validation/dataset.py validation/build_index_only.py /work/validation/
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 
 # emite index.bin v2 SoA (default)
-RUN python validation/build_index_only.py /work/data/index.bin
+RUN python validation/build_index_only.py --blocks /work/data/index.bin
 
 # ---------- 2) runtime ----------
 FROM --platform=linux/amd64 debian:bookworm-slim AS runtime

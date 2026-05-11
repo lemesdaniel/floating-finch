@@ -10,7 +10,7 @@ const httpz = @import("httpz");
 const types = @import("types.zig");
 const ivf = @import("ivf.zig");
 const search = @import("search.zig");
-const vectorize = @import("vectorize.zig");
+const vectorize = @import("vectorize_fast.zig");
 const quantize = @import("quantize.zig");
 
 // Silencia logs do httpz e qualquer scope em hot path. std.log default escreve

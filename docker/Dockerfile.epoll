@@ -1,0 +1,28 @@
+# syntax=docker/dockerfile:1.7
+# Zig epoll-custom HTTP server (sem httpz).
+
+FROM --platform=linux/amd64 python:3.11-slim AS preproc
+WORKDIR /work
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends curl ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+ARG RINHA_DATA_REF=main
+RUN mkdir -p data \
+    && curl -fsSL \
+       "https://raw.githubusercontent.com/zanfranceschi/rinha-de-backend-2026/${RINHA_DATA_REF}/resources/references.json.gz" \
+       -o data/references.json.gz
+RUN pip install --no-cache-dir numpy scikit-learn ijson tqdm
+COPY validation/dataset.py validation/build_index_only.py /work/validation/
+ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
+RUN python validation/build_index_only.py --blocks /work/data/index.bin
+
+FROM --platform=linux/amd64 debian:bookworm-slim AS runtime
+LABEL org.opencontainers.image.source="https://github.com/lemesdaniel/floating-finch-zig"
+LABEL org.opencontainers.image.description="Rinha 2026 — Zig epoll custom server"
+LABEL org.opencontainers.image.licenses="MIT"
+WORKDIR /app
+COPY zig/zig-out/bin/floating_finch_epoll /app/floating_finch
+COPY --from=preproc /work/data/index.bin /app/data/index.bin
+ENV INDEX_PATH=/app/data/index.bin
+EXPOSE 8080
+ENTRYPOINT ["/app/floating_finch"]

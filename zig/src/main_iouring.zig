@@ -43,6 +43,7 @@ fn initFraudResponses(buf: *[6][512]u8) void {
 const Config = struct {
     uds_path: []const u8,
     index_path: []const u8,
+    worker_threads: u32,
     search: search.SearchConfig,
 };
 
@@ -64,6 +65,7 @@ fn loadConfig() Config {
     return .{
         .uds_path = envOr("UDS_PATH", ""),
         .index_path = envOr("INDEX_PATH", "./index.bin"),
+        .worker_threads = envU32("WORKER_THREADS", 2),
         .search = .{
             .nprobe = envU32("IVF_NPROBE", 4),
             .bbox_repair = envBool("IVF_BBOX_REPAIR", true),
@@ -426,6 +428,8 @@ fn bindUds(path: []const u8) !posix.fd_t {
 
 fn initRing() !linux.IoUring {
     // Tenta flags otimizadas (kernel 6.1+); cai pra default em kernels mais antigos.
+    // SINGLE_ISSUER + DEFER_TASKRUN: cada thread tem seu ring isolado, kernel
+    // não precisa cross-thread wakeup — vale por worker.
     const optimized = linux.IORING_SETUP_SINGLE_ISSUER | linux.IORING_SETUP_DEFER_TASKRUN | linux.IORING_SETUP_COOP_TASKRUN;
     if (linux.IoUring.init(1024, optimized)) |r| {
         return r;
@@ -434,6 +438,36 @@ fn initRing() !linux.IoUring {
         return r;
     } else |_| {}
     return try linux.IoUring.init(1024, 0);
+}
+
+// -------- Worker --------
+
+const Worker = struct {
+    id: u32,
+    index: *const ivf.IvfIndex,
+    cfg: search.SearchConfig,
+    listener_fd: posix.fd_t,
+    gpa: std.mem.Allocator,
+    ready: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+};
+
+fn workerEntry(w: *Worker) void {
+    workerRun(w) catch {};
+}
+
+fn workerRun(w: *Worker) !void {
+    var ring = try initRing();
+    defer ring.deinit();
+
+    var app = App{
+        .index = w.index,
+        .cfg = w.cfg,
+        .ring = &ring,
+        .listener_fd = w.listener_fd,
+        .gpa = w.gpa,
+    };
+    w.ready.store(true, .release);
+    try serve(&app);
 }
 
 pub fn main() !void {
@@ -451,16 +485,42 @@ pub fn main() !void {
     if (cfg.uds_path.len == 0) return error.UdsRequired;
     const listener_fd = try bindUds(cfg.uds_path);
 
-    var ring = try initRing();
-    defer ring.deinit();
+    const n = if (cfg.worker_threads == 0) 1 else cfg.worker_threads;
 
-    var app = App{
-        .index = &idx,
-        .cfg = cfg.search,
-        .ring = &ring,
-        .listener_fd = listener_fd,
-        .gpa = gpa,
-    };
+    // Single-thread path: roda no main, sem overhead de thread spawn.
+    if (n == 1) {
+        var ring = try initRing();
+        defer ring.deinit();
+        var app = App{
+            .index = &idx,
+            .cfg = cfg.search,
+            .ring = &ring,
+            .listener_fd = listener_fd,
+            .gpa = gpa,
+        };
+        try serve(&app);
+        return;
+    }
 
-    try serve(&app);
+    // Multi-thread: N workers, cada um com io_uring próprio compartilhando listener_fd.
+    // io_uring kernel-side garante que ACCEPT_MULTISHOT em rings diferentes não duplica
+    // CQEs por conn — cada conexão entregue a um ring (round-robin interno do kernel).
+    const workers = try gpa.alloc(Worker, n);
+    defer gpa.free(workers);
+    const threads = try gpa.alloc(std.Thread, n);
+    defer gpa.free(threads);
+
+    for (workers, 0..) |*w, i| {
+        w.* = .{
+            .id = @intCast(i),
+            .index = &idx,
+            .cfg = cfg.search,
+            .listener_fd = listener_fd,
+            .gpa = gpa,
+        };
+    }
+    for (workers, 0..) |*w, i| {
+        threads[i] = try std.Thread.spawn(.{}, workerEntry, .{w});
+    }
+    for (threads) |t| t.join();
 }

@@ -42,14 +42,14 @@ pub fn build(b: *std.Build) void {
         b.installArtifact(exe);
     }
 
-    // Binário io_uring custom
+    // Binário io_uring custom (multi-thread: spawn N workers, cada um com io_uring próprio)
     {
         const m = b.createModule(.{
             .root_source_file = b.path("src/main_iouring.zig"),
             .target = target,
             .optimize = optimize,
             .link_libc = true,
-            .single_threaded = true,
+            .single_threaded = false,
         });
         const exe = b.addExecutable(.{
             .name = "floating_finch_iouring",

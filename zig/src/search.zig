@@ -24,13 +24,17 @@ pub const SearchConfig = struct {
     /// Se 0, usa path legacy com nprobe + bbox_repair.
     fast_probe: u32 = 0,
     /// Rescue: probes adicionais shortlist[fast_probe..fast_probe+rescue_probe]
-    /// quando fraud_count cai na janela ambígua.
-    rescue_probe: u32 = 24,
+    /// quando o gating de reprobe dispara.
+    rescue_probe: u32 = 20,
     /// Tamanho da shortlist ordenada por distância (≤ MaxShortlist).
-    shortlist_size: u32 = 32,
-    /// Janela ambígua que dispara reprobe (inclusive).
+    shortlist_size: u32 = 24,
+    /// Janela ambígua (cardinal) que dispara reprobe — fallback se thresholds
+    /// estiverem todos zero. Mantido pra compatibilidade.
     ambig_min: u32 = 1,
     ambig_max: u32 = 4,
+    /// Per-class worst-distance threshold: se top5.worst_dist >= threshold[fc],
+    /// dispara reprobe. Calibrado offline. Quando todos == 0, cai pra ambig window.
+    extreme_thresholds: [6]i64 = .{ 0, 0, 0, 0, 0, 0 },
     /// Legacy bbox repair (usado só quando fast_probe == 0, ou como fallback final).
     bbox_repair: bool = true,
     repair_min: u32 = 1,
@@ -328,12 +332,26 @@ fn fraudCountShortlist(
 
     var fraud = top.fraudCount();
 
-    // Reprobe seletivo: shortlist[fast..fast+rescue], só se ambíguo.
-    if (rescue > 0 and fraud >= cfg.ambig_min and fraud <= cfg.ambig_max) {
-        for (shortlist[fast .. fast + rescue]) |c| {
-            if (c != std.math.maxInt(usize)) searchCluster(idx, c, qI, &top);
+    // Reprobe seletivo: shortlist[fast..fast+rescue].
+    // Gating principal: per-class worst-distance threshold (calibrado offline).
+    // Fallback: janela ambígua cardinal (ambig_min..ambig_max).
+    if (rescue > 0) {
+        const worst_dist = top.distances[top.worst];
+        const has_thr = blk: {
+            inline for (cfg.extreme_thresholds) |t| if (t != 0) break :blk true;
+            break :blk false;
+        };
+        const should_reprobe = if (has_thr)
+            worst_dist >= cfg.extreme_thresholds[fraud]
+        else
+            (fraud >= cfg.ambig_min and fraud <= cfg.ambig_max);
+
+        if (should_reprobe) {
+            for (shortlist[fast .. fast + rescue]) |c| {
+                if (c != std.math.maxInt(usize)) searchCluster(idx, c, qI, &top);
+            }
+            fraud = top.fraudCount();
         }
-        fraud = top.fraudCount();
     }
 
     // Fallback bbox repair opcional, após reprobe seletivo.

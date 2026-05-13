@@ -49,6 +49,11 @@ fn envU32(name: []const u8, default: u32) u32 {
     return std.fmt.parseUnsigned(u32, v, 10) catch default;
 }
 
+fn envI64(name: []const u8, default: i64) i64 {
+    const v = std.posix.getenv(name) orelse return default;
+    return std.fmt.parseInt(i64, v, 10) catch default;
+}
+
 fn envBool(name: []const u8, default: bool) bool {
     const v = std.posix.getenv(name) orelse return default;
     if (std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "yes"))
@@ -67,10 +72,18 @@ fn loadConfig() Config {
         .search = .{
             .nprobe = envU32("IVF_NPROBE", 4),
             .fast_probe = envU32("IVF_FAST_PROBE", 0),
-            .rescue_probe = envU32("IVF_RESCUE_PROBE", 24),
-            .shortlist_size = envU32("IVF_SHORTLIST", 32),
+            .rescue_probe = envU32("IVF_RESCUE_PROBE", 20),
+            .shortlist_size = envU32("IVF_SHORTLIST", 24),
             .ambig_min = envU32("IVF_AMBIG_MIN", 1),
             .ambig_max = envU32("IVF_AMBIG_MAX", 4),
+            .extreme_thresholds = .{
+                envI64("IVF_EXTREME_T0", 0),
+                envI64("IVF_EXTREME_T1", 0),
+                envI64("IVF_EXTREME_T2", 0),
+                envI64("IVF_EXTREME_T3", 0),
+                envI64("IVF_EXTREME_T4", 0),
+                envI64("IVF_EXTREME_T5", 0),
+            },
             .bbox_repair = envBool("IVF_BBOX_REPAIR", true),
             .repair_min = envU32("IVF_REPAIR_MIN", 1),
             .repair_max = envU32("IVF_REPAIR_MAX", 4),

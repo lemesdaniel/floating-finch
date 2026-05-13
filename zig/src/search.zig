@@ -14,8 +14,24 @@ const std = @import("std");
 const types = @import("types.zig");
 const ivf = @import("ivf.zig");
 
+/// Tamanho máximo de shortlist (capacity fixa em stack — evita alloc).
+pub const MaxShortlist: usize = 64;
+
 pub const SearchConfig = struct {
+    /// Legacy: nprobe simples (usado quando fast_probe == 0).
     nprobe: u32 = 4,
+    /// Two-stage probe: fast pass probes shortlist[0..fast_probe].
+    /// Se 0, usa path legacy com nprobe + bbox_repair.
+    fast_probe: u32 = 0,
+    /// Rescue: probes adicionais shortlist[fast_probe..fast_probe+rescue_probe]
+    /// quando fraud_count cai na janela ambígua.
+    rescue_probe: u32 = 24,
+    /// Tamanho da shortlist ordenada por distância (≤ MaxShortlist).
+    shortlist_size: u32 = 32,
+    /// Janela ambígua que dispara reprobe (inclusive).
+    ambig_min: u32 = 1,
+    ambig_max: u32 = 4,
+    /// Legacy bbox repair (usado só quando fast_probe == 0, ou como fallback final).
     bbox_repair: bool = true,
     repair_min: u32 = 1,
     repair_max: u32 = 4,
@@ -79,7 +95,8 @@ fn nearestCentroids(
     out_buf: []usize,
 ) void {
     std.debug.assert(nprobe <= out_buf.len);
-    var dists: [8]f32 = [_]f32{std.math.floatMax(f32)} ** 8;
+    std.debug.assert(nprobe <= MaxShortlist);
+    var dists: [MaxShortlist]f32 = [_]f32{std.math.floatMax(f32)} ** MaxShortlist;
     for (0..nprobe) |i| out_buf[i] = std.math.maxInt(usize);
 
     var c: usize = 0;
@@ -235,6 +252,17 @@ pub fn fraudCount(
     qI: types.QueryI16,
     cfg: SearchConfig,
 ) u8 {
+    // Path novo two-stage: fast_probe > 0 ativa shortlist.
+    if (cfg.fast_probe > 0) return fraudCountShortlist(idx, qF, qI, cfg);
+    return fraudCountLegacy(idx, qF, qI, cfg);
+}
+
+fn fraudCountLegacy(
+    idx: *const ivf.IvfIndex,
+    qF: types.QueryF32,
+    qI: types.QueryI16,
+    cfg: SearchConfig,
+) u8 {
     var top = Top5{};
     var probes_buf: [8]usize = undefined;
     const nprobe = @min(@max(cfg.nprobe, 1), 8);
@@ -259,6 +287,61 @@ pub fn fraudCount(
                 }
             }
             if (probed) continue;
+            if (bboxMinSqDistance(idx, c, qI) >= threshold) continue;
+            searchCluster(idx, c, qI, &top);
+        }
+        fraud = top.fraudCount();
+    }
+
+    return fraud;
+}
+
+fn fraudCountShortlist(
+    idx: *const ivf.IvfIndex,
+    qF: types.QueryF32,
+    qI: types.QueryI16,
+    cfg: SearchConfig,
+) u8 {
+    const fast: usize = @min(@max(@as(usize, cfg.fast_probe), 1), MaxShortlist);
+    const rescue: usize = @min(@as(usize, cfg.rescue_probe), MaxShortlist - fast);
+    var shortlist_size: usize = @max(@as(usize, cfg.shortlist_size), fast + rescue);
+    shortlist_size = @min(shortlist_size, MaxShortlist);
+
+    var shortlist_buf: [MaxShortlist]usize = undefined;
+    const shortlist = shortlist_buf[0..shortlist_size];
+    nearestCentroids(idx, qF, shortlist_size, shortlist);
+
+    var top = Top5{};
+
+    // Fast pass: probe shortlist[0..fast].
+    for (shortlist[0..fast]) |c| {
+        if (c != std.math.maxInt(usize)) searchCluster(idx, c, qI, &top);
+    }
+
+    var fraud = top.fraudCount();
+
+    // Reprobe seletivo: shortlist[fast..fast+rescue], só se ambíguo.
+    if (rescue > 0 and fraud >= cfg.ambig_min and fraud <= cfg.ambig_max) {
+        for (shortlist[fast .. fast + rescue]) |c| {
+            if (c != std.math.maxInt(usize)) searchCluster(idx, c, qI, &top);
+        }
+        fraud = top.fraudCount();
+    }
+
+    // Fallback bbox repair opcional, após reprobe seletivo.
+    if (cfg.bbox_repair and fraud >= cfg.repair_min and fraud <= cfg.repair_max) {
+        const threshold = top.distances[top.worst];
+        const probed = shortlist[0 .. fast + rescue];
+        var c: usize = 0;
+        while (c < idx.n_clusters) : (c += 1) {
+            var already = false;
+            for (probed) |p| {
+                if (p == c) {
+                    already = true;
+                    break;
+                }
+            }
+            if (already) continue;
             if (bboxMinSqDistance(idx, c, qI) >= threshold) continue;
             searchCluster(idx, c, qI, &top);
         }

@@ -66,6 +66,11 @@ fn loadConfig() Config {
         .index_path = envOr("INDEX_PATH", "./index.bin"),
         .search = .{
             .nprobe = envU32("IVF_NPROBE", 4),
+            .fast_probe = envU32("IVF_FAST_PROBE", 0),
+            .rescue_probe = envU32("IVF_RESCUE_PROBE", 24),
+            .shortlist_size = envU32("IVF_SHORTLIST", 32),
+            .ambig_min = envU32("IVF_AMBIG_MIN", 1),
+            .ambig_max = envU32("IVF_AMBIG_MAX", 4),
             .bbox_repair = envBool("IVF_BBOX_REPAIR", true),
             .repair_min = envU32("IVF_REPAIR_MIN", 1),
             .repair_max = envU32("IVF_REPAIR_MAX", 4),
@@ -131,8 +136,10 @@ pub fn main() !void {
     var idx = try ivf.loadIndex(cfg.index_path);
     defer idx.deinit();
     std.log.info("  n={d}  k={d}", .{ idx.n_vectors, idx.n_clusters });
-    std.log.info("  config: nprobe={d}  bboxRepair={any}  repair=[{d}-{d}]", .{
-        cfg.search.nprobe, cfg.search.bbox_repair, cfg.search.repair_min, cfg.search.repair_max,
+    std.log.info("  config: nprobe={d}  fast={d}  rescue={d}  shortlist={d}  ambig=[{d}-{d}]  bboxRepair={any}  repair=[{d}-{d}]", .{
+        cfg.search.nprobe,        cfg.search.fast_probe, cfg.search.rescue_probe,
+        cfg.search.shortlist_size, cfg.search.ambig_min,  cfg.search.ambig_max,
+        cfg.search.bbox_repair,   cfg.search.repair_min, cfg.search.repair_max,
     });
 
     // Pre-warm: aquece I-cache, decoded-uop cache, branch predictor + força page

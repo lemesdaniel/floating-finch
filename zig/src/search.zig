@@ -194,9 +194,17 @@ fn searchClusterBlocks(idx: *const ivf.IvfIndex, c: usize, q: types.QueryI16, to
     var q_f32: [types.Dim]f32 = undefined;
     inline for (0..types.Dim) |d| q_f32[d] = @floatFromInt(q[d]);
 
+    const prefetch_dist: usize = 2; // 2 blocks à frente cobre ~448B / ~7 cache lines
+
     var bk: usize = 0;
     while (bk < n_blocks) : (bk += 1) {
         const block_ptr = idx.vectors + (bk_start + bk) * ivf.BlockStride;
+
+        // Prefetch do bloco bk+prefetch_dist (T0, read, data).
+        if (bk + prefetch_dist < n_blocks) {
+            const pf_ptr = idx.vectors + (bk_start + bk + prefetch_dist) * ivf.BlockStride;
+            @prefetch(pf_ptr, .{ .rw = .read, .locality = 3, .cache = .data });
+        }
 
         // dims 0..7 — FMA com acumulador f32×8
         var sum_lo: @Vector(8, f32) = @splat(0);

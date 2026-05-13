@@ -6,6 +6,7 @@ Reusa as constantes/parâmetros calibrados em §6.7 e §6.10.
 
 from __future__ import annotations
 
+import os
 import struct
 import sys
 from pathlib import Path
@@ -18,12 +19,12 @@ from dataset import DATA_DIR, load_references
 
 DIM = 14
 QUANT_SCALE = 10_000.0
-CLUSTERS = 2048
-TRAIN_SAMPLE = 65_536
-ITERATIONS = 6
-SEED = 42
+CLUSTERS = int(os.environ.get("IVF_CLUSTERS", "2048"))
+TRAIN_SAMPLE = int(os.environ.get("IVF_TRAIN_SAMPLE", "65536"))
+ITERATIONS = int(os.environ.get("IVF_KMEANS_ITERS", "6"))
+SEED = int(os.environ.get("IVF_SEED", "42"))
 
-INDEX_CACHE = DATA_DIR / "ivf_kmeans.npz"
+INDEX_CACHE = DATA_DIR / f"ivf_kmeans_k{CLUSTERS}.npz"
 HEADER_SIZE = 64
 ALIGN = 64
 MAGIC = b"RIVF"

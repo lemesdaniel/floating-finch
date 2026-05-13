@@ -29,7 +29,10 @@ COPY validation/dataset.py validation/build_index_only.py /work/validation/
 
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 
-# emite index.bin v2 SoA (default)
+ARG IVF_CLUSTERS=4096
+ENV IVF_CLUSTERS=${IVF_CLUSTERS}
+
+# emite index.bin v3 blocks com K=$IVF_CLUSTERS
 RUN python validation/build_index_only.py --blocks /work/data/index.bin
 
 # ---------- 2) runtime ----------

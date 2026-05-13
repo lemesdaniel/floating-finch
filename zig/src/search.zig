@@ -195,80 +195,72 @@ fn searchClusterBlocks(idx: *const ivf.IvfIndex, c: usize, q: types.QueryI16, to
     const n_blocks = bk_end - bk_start;
     if (n_blocks == 0) return;
 
-    // Query em i32 (de i16). Não há conversão fp envolvida no hot path.
-    var q_i32: [types.Dim]i32 = undefined;
-    inline for (0..types.Dim) |d| q_i32[d] = @intCast(q[d]);
-
-    // Cutoff em i32 — clampa worst (i64) pra range i32. Inicial = maxInt(i32),
-    // pruning não dispara até top5 ter algo.
-    const worst_i64 = top.distances[top.worst];
-    var cutoff: i32 = if (worst_i64 > std.math.maxInt(i32))
-        std.math.maxInt(i32)
-    else
-        @intCast(worst_i64);
+    var q_f32: [types.Dim]f32 = undefined;
+    inline for (0..types.Dim) |d| q_f32[d] = @floatFromInt(q[d]);
 
     var bk: usize = 0;
     while (bk < n_blocks) : (bk += 1) {
         const block_ptr = idx.vectors + (bk_start + bk) * ivf.BlockStride;
 
-        // Stage 1: dims 0..4 — acumulador i32×8
-        var sum: @Vector(8, i32) = @splat(0);
+        // Threshold (f32) computado uma vez por block.
+        const thr: f32 = @floatFromInt(top.distances[top.worst]);
+        const thr_v: @Vector(8, f32) = @splat(thr);
+
+        // Stage 1: dims 0..4 — FMA com acumulador f32×8
+        var sum: @Vector(8, f32) = @splat(0);
         inline for (0..4) |d| {
             const slot = block_ptr + d * ivf.BlockSize;
             const v_i16: @Vector(8, i16) = slot[0..8].*;
             const v_i32: @Vector(8, i32) = v_i16;
-            const q_v: @Vector(8, i32) = @splat(q_i32[d]);
-            const diff = v_i32 - q_v;
-            sum += diff * diff;
+            const v_f32: @Vector(8, f32) = @floatFromInt(v_i32);
+            const q_v: @Vector(8, f32) = @splat(q_f32[d]);
+            const diff = v_f32 - q_v;
+            sum = @mulAdd(@Vector(8, f32), diff, diff, sum);
         }
-        // Cutoff check 1 — se TODAS lanes >= cutoff, sem chance de entrar no top5.
-        if (@reduce(.Min, sum) >= cutoff) continue;
+        if (!@reduce(.Or, sum < thr_v)) continue;
 
         // Stage 2: dims 4..6
         inline for (4..6) |d| {
             const slot = block_ptr + d * ivf.BlockSize;
             const v_i16: @Vector(8, i16) = slot[0..8].*;
             const v_i32: @Vector(8, i32) = v_i16;
-            const q_v: @Vector(8, i32) = @splat(q_i32[d]);
-            const diff = v_i32 - q_v;
-            sum += diff * diff;
+            const v_f32: @Vector(8, f32) = @floatFromInt(v_i32);
+            const q_v: @Vector(8, f32) = @splat(q_f32[d]);
+            const diff = v_f32 - q_v;
+            sum = @mulAdd(@Vector(8, f32), diff, diff, sum);
         }
-        if (@reduce(.Min, sum) >= cutoff) continue;
+        if (!@reduce(.Or, sum < thr_v)) continue;
 
         // Stage 3: dims 6..8
         inline for (6..8) |d| {
             const slot = block_ptr + d * ivf.BlockSize;
             const v_i16: @Vector(8, i16) = slot[0..8].*;
             const v_i32: @Vector(8, i32) = v_i16;
-            const q_v: @Vector(8, i32) = @splat(q_i32[d]);
-            const diff = v_i32 - q_v;
-            sum += diff * diff;
+            const v_f32: @Vector(8, f32) = @floatFromInt(v_i32);
+            const q_v: @Vector(8, f32) = @splat(q_f32[d]);
+            const diff = v_f32 - q_v;
+            sum = @mulAdd(@Vector(8, f32), diff, diff, sum);
         }
-        if (@reduce(.Min, sum) >= cutoff) continue;
+        if (!@reduce(.Or, sum < thr_v)) continue;
 
-        // Final: dims 8..14 (6 dims). Sem cutoff check intermediário.
+        // Final: dims 8..14 (6 dims).
         inline for (8..14) |d| {
             const slot = block_ptr + d * ivf.BlockSize;
             const v_i16: @Vector(8, i16) = slot[0..8].*;
             const v_i32: @Vector(8, i32) = v_i16;
-            const q_v: @Vector(8, i32) = @splat(q_i32[d]);
-            const diff = v_i32 - q_v;
-            sum += diff * diff;
+            const v_f32: @Vector(8, f32) = @floatFromInt(v_i32);
+            const q_v: @Vector(8, f32) = @splat(q_f32[d]);
+            const diff = v_f32 - q_v;
+            sum = @mulAdd(@Vector(8, f32), diff, diff, sum);
         }
 
-        const total_arr: [8]i32 = sum;
+        const total_arr: [8]f32 = sum;
         const base_idx = bk * ivf.BlockSize;
         const lane_count = @min(@as(usize, ivf.BlockSize), n_valid - base_idx);
         var j: usize = 0;
         while (j < lane_count) : (j += 1) {
-            top.tryInsert(@as(i64, total_arr[j]), idx.labels[s + base_idx + j]);
+            top.tryInsert(@intFromFloat(total_arr[j]), idx.labels[s + base_idx + j]);
         }
-        // Refresca cutoff após inserções: top5.worst pode ter melhorado.
-        const new_worst = top.distances[top.worst];
-        cutoff = if (new_worst > std.math.maxInt(i32))
-            std.math.maxInt(i32)
-        else
-            @intCast(new_worst);
     }
 }
 

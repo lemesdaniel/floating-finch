@@ -22,7 +22,7 @@ pub const std_options: std.Options = .{
 
 fn silentLog(
     comptime _: std.log.Level,
-    comptime _: @Type(.enum_literal),
+    comptime _: @EnumLiteral(),
     comptime _: []const u8,
     _: anytype,
 ) void {}
@@ -40,22 +40,27 @@ const Config = struct {
     search: search.SearchConfig,
 };
 
+fn envRaw(name: []const u8) ?[]const u8 {
+    var name_buf: [128]u8 = undefined;
+    if (name.len >= name_buf.len) return null;
+    @memcpy(name_buf[0..name.len], name);
+    name_buf[name.len] = 0;
+    const name_z: [*:0]const u8 = @ptrCast(&name_buf);
+    const v = std.c.getenv(name_z) orelse return null;
+    return std.mem.span(v);
+}
+
 fn envOr(name: []const u8, default: []const u8) []const u8 {
-    return std.posix.getenv(name) orelse default;
+    return envRaw(name) orelse default;
 }
 
 fn envU32(name: []const u8, default: u32) u32 {
-    const v = std.posix.getenv(name) orelse return default;
+    const v = envRaw(name) orelse return default;
     return std.fmt.parseUnsigned(u32, v, 10) catch default;
 }
 
-fn envI64(name: []const u8, default: i64) i64 {
-    const v = std.posix.getenv(name) orelse return default;
-    return std.fmt.parseInt(i64, v, 10) catch default;
-}
-
 fn envBool(name: []const u8, default: bool) bool {
-    const v = std.posix.getenv(name) orelse return default;
+    const v = envRaw(name) orelse return default;
     if (std.mem.eql(u8, v, "1") or std.mem.eql(u8, v, "true") or std.mem.eql(u8, v, "yes"))
         return true;
     if (std.mem.eql(u8, v, "0") or std.mem.eql(u8, v, "false") or std.mem.eql(u8, v, "no"))
@@ -71,19 +76,6 @@ fn loadConfig() Config {
         .index_path = envOr("INDEX_PATH", "./index.bin"),
         .search = .{
             .nprobe = envU32("IVF_NPROBE", 4),
-            .fast_probe = envU32("IVF_FAST_PROBE", 0),
-            .rescue_probe = envU32("IVF_RESCUE_PROBE", 20),
-            .shortlist_size = envU32("IVF_SHORTLIST", 24),
-            .ambig_min = envU32("IVF_AMBIG_MIN", 1),
-            .ambig_max = envU32("IVF_AMBIG_MAX", 4),
-            .extreme_thresholds = .{
-                envI64("IVF_EXTREME_T0", 0),
-                envI64("IVF_EXTREME_T1", 0),
-                envI64("IVF_EXTREME_T2", 0),
-                envI64("IVF_EXTREME_T3", 0),
-                envI64("IVF_EXTREME_T4", 0),
-                envI64("IVF_EXTREME_T5", 0),
-            },
             .bbox_repair = envBool("IVF_BBOX_REPAIR", true),
             .repair_min = envU32("IVF_REPAIR_MIN", 1),
             .repair_max = envU32("IVF_REPAIR_MAX", 4),
@@ -145,14 +137,17 @@ pub fn main() !void {
     const cfg = loadConfig();
     const allocator = std.heap.c_allocator;
 
+    // Zig 0.16: I/O abstraction obrigatório via std.Io.Threaded.
+    var threaded = std.Io.Threaded.init(allocator, .{});
+    defer threaded.deinit();
+    const io = threaded.io();
+
     std.log.info("loading index from {s}", .{cfg.index_path});
     var idx = try ivf.loadIndex(cfg.index_path);
     defer idx.deinit();
     std.log.info("  n={d}  k={d}", .{ idx.n_vectors, idx.n_clusters });
-    std.log.info("  config: nprobe={d}  fast={d}  rescue={d}  shortlist={d}  ambig=[{d}-{d}]  bboxRepair={any}  repair=[{d}-{d}]", .{
-        cfg.search.nprobe,        cfg.search.fast_probe, cfg.search.rescue_probe,
-        cfg.search.shortlist_size, cfg.search.ambig_min,  cfg.search.ambig_max,
-        cfg.search.bbox_repair,   cfg.search.repair_min, cfg.search.repair_max,
+    std.log.info("  config: nprobe={d}  bboxRepair={any}  repair=[{d}-{d}]", .{
+        cfg.search.nprobe, cfg.search.bbox_repair, cfg.search.repair_min, cfg.search.repair_max,
     });
 
     // Pre-warm: aquece I-cache, decoded-uop cache, branch predictor + força page
@@ -161,25 +156,29 @@ pub fn main() !void {
 
     var app = App{ .index = &idx, .cfg = cfg.search };
 
-    // Remove socket UDS pré-existente (de crash anterior) pra evitar EADDRINUSE
+    // Remove socket UDS pré-existente (de crash anterior) pra evitar EADDRINUSE.
+    // Zig 0.16 removeu std.fs.deleteFileAbsolute — usa libc unlink direto.
     if (cfg.uds_path.len > 0) {
-        std.fs.deleteFileAbsolute(cfg.uds_path) catch {};
+        var path_buf: [4096]u8 = undefined;
+        if (cfg.uds_path.len < path_buf.len) {
+            @memcpy(path_buf[0..cfg.uds_path.len], cfg.uds_path);
+            path_buf[cfg.uds_path.len] = 0;
+            const path_z: [*:0]const u8 = @ptrCast(&path_buf);
+            _ = std.c.unlink(path_z);
+        }
     }
 
-    const AddrConfig = httpz.Config.AddressConfig;
-    const addr_cfg: AddrConfig = if (cfg.uds_path.len > 0)
+    const addr: httpz.Config.Address = if (cfg.uds_path.len > 0)
         .{ .unix = cfg.uds_path }
     else
-        .{ .ip = .{ .host = cfg.bind_host, .port = cfg.bind_port } };
+        .{ .ip = .{ .ip4 = .{ .bytes = .{ 0, 0, 0, 0 }, .port = cfg.bind_port } } };
 
-    var server = try httpz.Server(*App).init(allocator, .{
-        .address = addr_cfg,
+    var server = try httpz.Server(*App).init(io, allocator, .{
+        .address = addr,
         .request = .{
             .max_body_size = 64 * 1024,
         },
         .thread_pool = .{
-            // 3 workers = sweet spot empírico sob 0.40 CPU/container.
-            // 1: p99 9.6ms / 2: p99 4.1ms / 3: p99 3.1ms / 4: p99 15.7ms (thrashing).
             .count = 3,
             .buffer_size = 64 * 1024,
         },
@@ -199,21 +198,20 @@ pub fn main() !void {
         // chmod 0666 pro nginx (rodando como nginx user) poder conectar
         // dispatcha em thread paralela porque server.listen() bloqueia
         const ChmodCtx = struct {
+            extern "c" fn access(path: [*:0]const u8, mode: c_int) c_int;
+            extern "c" fn usleep(usec: c_uint) c_int;
             fn run(path: []const u8) void {
-                // espera socket ser criado
-                var i: u32 = 0;
-                while (i < 50) : (i += 1) {
-                    std.fs.accessAbsolute(path, .{}) catch {
-                        std.Thread.sleep(20 * std.time.ns_per_ms);
-                        continue;
-                    };
-                    break;
-                }
                 var path_buf: [4096]u8 = undefined;
                 if (path.len >= path_buf.len) return;
                 @memcpy(path_buf[0..path.len], path);
                 path_buf[path.len] = 0;
                 const path_z: [*:0]const u8 = @ptrCast(&path_buf);
+                // espera socket ser criado
+                var i: u32 = 0;
+                while (i < 50) : (i += 1) {
+                    if (access(path_z, 0) == 0) break;
+                    _ = usleep(20_000); // 20ms
+                }
                 _ = std.c.chmod(path_z, 0o666);
             }
         };

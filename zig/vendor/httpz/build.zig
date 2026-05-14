@@ -11,6 +11,7 @@ pub fn build(b: *std.Build) !void {
     const enable_tsan = b.option(bool, "tsan", "Enable ThreadSanitizer");
 
     const httpz_module = b.addModule("httpz", .{
+        .link_libc = true,
         .root_source_file = b.path("src/httpz.zig"),
         .target = target,
         .optimize = optimize,
@@ -26,79 +27,5 @@ pub fn build(b: *std.Build) !void {
         httpz_module.addOptions("build", options);
     }
 
-    {
-        const test_filter = b.option([]const []const u8, "test-filter", "Filters for test: specify multiple times for multiple filters");
-        const tests = b.addTest(.{
-            .root_module = httpz_module,
-            .filters = test_filter orelse &.{},
-            .test_runner = .{ .path = b.path("test_runner.zig"), .mode = .simple },
-        });
-        tests.linkLibC();
-        const force_blocking = b.option(bool, "force_blocking", "Force blocking mode") orelse false;
-        {
-            const options = b.addOptions();
-            options.addOption(bool, "httpz_blocking", force_blocking);
-            tests.root_module.addOptions("build", options);
-        }
-        {
-            const options = b.addOptions();
-            options.addOption(bool, "websocket_blocking", force_blocking);
-            websocket_module.addOptions("build", options);
-        }
-
-        tests.root_module.addImport("metrics", metrics_module);
-        tests.root_module.addImport("websocket", websocket_module);
-        const run_test = b.addRunArtifact(tests);
-        run_test.has_side_effects = true;
-
-        const test_step = b.step("test", "Run tests");
-        test_step.dependOn(&run_test.step);
-    }
-
-    const examples = [_]struct {
-        file: []const u8,
-        name: []const u8,
-        libc: bool = false,
-    }{
-        .{ .file = "examples/01_basic.zig", .name = "example_1" },
-        .{ .file = "examples/02_handler.zig", .name = "example_2" },
-        .{ .file = "examples/03_dispatch.zig", .name = "example_3" },
-        .{ .file = "examples/04_action_context.zig", .name = "example_4" },
-        .{ .file = "examples/05_request_takeover.zig", .name = "example_5" },
-        .{ .file = "examples/06_middleware.zig", .name = "example_6" },
-        .{ .file = "examples/07_advanced_routing.zig", .name = "example_7" },
-        .{ .file = "examples/08_websocket.zig", .name = "example_8" },
-        .{ .file = "examples/09_shutdown.zig", .name = "example_9", .libc = true },
-        .{ .file = "examples/10_file_upload.zig", .name = "example_10" },
-        .{ .file = "examples/11_html_streaming.zig", .name = "example_11" },
-    };
-
-    {
-        for (examples) |ex| {
-            const exe = b.addExecutable(.{
-                .name = ex.name,
-                .root_module = b.createModule(.{
-                    .root_source_file = b.path(ex.file),
-                    .target = target,
-                    .optimize = optimize,
-                    .imports = &.{
-                        .{ .name = "httpz", .module = httpz_module },
-                    },
-                }),
-            });
-            if (ex.libc) {
-                exe.linkLibC();
-            }
-            b.installArtifact(exe);
-
-            const run_cmd = b.addRunArtifact(exe);
-            run_cmd.step.dependOn(b.getInstallStep());
-            if (b.args) |args| {
-                run_cmd.addArgs(args);
-            }
-
-            const run_step = b.step(ex.name, ex.file);
-            run_step.dependOn(&run_cmd.step);
-        }
-    }
+    // Skipping tests + examples — consumers only need the httpz module above.
 }

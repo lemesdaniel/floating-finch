@@ -47,20 +47,36 @@ fn alignUp(x: usize, a: usize) usize {
     return (x + a - 1) & ~(a - 1);
 }
 
-pub fn loadIndex(path: []const u8) !IvfIndex {
-    const file = try std.fs.cwd().openFile(path, .{ .mode = .read_only });
-    defer file.close();
+// Bindings libc diretos — Zig 0.16 removeu std.fs.cwd/openFile/file.stat;
+// transição pra std.Io.Dir custa boilerplate. Usamos open/lseek/close direto.
+extern "c" fn open(path: [*:0]const u8, flags: c_int) c_int;
+extern "c" fn close(fd: c_int) c_int;
+extern "c" fn lseek(fd: c_int, offset: i64, whence: c_int) i64;
+const O_RDONLY: c_int = 0;
+const SEEK_END: c_int = 2;
 
-    const stat = try file.stat();
-    const size: usize = @intCast(stat.size);
+pub fn loadIndex(path: []const u8) !IvfIndex {
+    var path_buf: [4096]u8 = undefined;
+    if (path.len >= path_buf.len) return error.PathTooLong;
+    @memcpy(path_buf[0..path.len], path);
+    path_buf[path.len] = 0;
+    const path_z: [*:0]const u8 = @ptrCast(&path_buf);
+
+    const fd = open(path_z, O_RDONLY);
+    if (fd < 0) return error.OpenFailed;
+    defer _ = close(fd);
+
+    const size_i64 = lseek(fd, 0, SEEK_END);
+    if (size_i64 <= 0) return error.SeekFailed;
+    const size: usize = @intCast(size_i64);
     if (size < HeaderSize) return error.FileTooSmall;
 
     const mapped = try std.posix.mmap(
         null,
         size,
-        std.posix.PROT.READ,
+        .{ .READ = true },
         .{ .TYPE = .SHARED, .POPULATE = true },
-        file.handle,
+        fd,
         0,
     );
 

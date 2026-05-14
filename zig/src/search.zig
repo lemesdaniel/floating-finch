@@ -14,28 +14,8 @@ const std = @import("std");
 const types = @import("types.zig");
 const ivf = @import("ivf.zig");
 
-/// Tamanho máximo de shortlist (capacity fixa em stack — evita alloc).
-pub const MaxShortlist: usize = 64;
-
 pub const SearchConfig = struct {
-    /// Legacy: nprobe simples (usado quando fast_probe == 0).
     nprobe: u32 = 4,
-    /// Two-stage probe: fast pass probes shortlist[0..fast_probe].
-    /// Se 0, usa path legacy com nprobe + bbox_repair.
-    fast_probe: u32 = 0,
-    /// Rescue: probes adicionais shortlist[fast_probe..fast_probe+rescue_probe]
-    /// quando o gating de reprobe dispara.
-    rescue_probe: u32 = 20,
-    /// Tamanho da shortlist ordenada por distância (≤ MaxShortlist).
-    shortlist_size: u32 = 24,
-    /// Janela ambígua (cardinal) que dispara reprobe — fallback se thresholds
-    /// estiverem todos zero. Mantido pra compatibilidade.
-    ambig_min: u32 = 1,
-    ambig_max: u32 = 4,
-    /// Per-class worst-distance threshold: se top5.worst_dist >= threshold[fc],
-    /// dispara reprobe. Calibrado offline. Quando todos == 0, cai pra ambig window.
-    extreme_thresholds: [6]i64 = .{ 0, 0, 0, 0, 0, 0 },
-    /// Legacy bbox repair (usado só quando fast_probe == 0, ou como fallback final).
     bbox_repair: bool = true,
     repair_min: u32 = 1,
     repair_max: u32 = 4,
@@ -99,8 +79,7 @@ fn nearestCentroids(
     out_buf: []usize,
 ) void {
     std.debug.assert(nprobe <= out_buf.len);
-    std.debug.assert(nprobe <= MaxShortlist);
-    var dists: [MaxShortlist]f32 = [_]f32{std.math.floatMax(f32)} ** MaxShortlist;
+    var dists: [8]f32 = [_]f32{std.math.floatMax(f32)} ** 8;
     for (0..nprobe) |i| out_buf[i] = std.math.maxInt(usize);
 
     var c: usize = 0;
@@ -202,48 +181,25 @@ fn searchClusterBlocks(idx: *const ivf.IvfIndex, c: usize, q: types.QueryI16, to
     while (bk < n_blocks) : (bk += 1) {
         const block_ptr = idx.vectors + (bk_start + bk) * ivf.BlockStride;
 
-        // Threshold (f32) computado uma vez por block.
+        // dims 0..7 — FMA com acumulador f32×8
+        var sum_lo: @Vector(8, f32) = @splat(0);
+        inline for (0..8) |d| {
+            const slot = block_ptr + d * ivf.BlockSize;
+            const v_i16: @Vector(8, i16) = slot[0..8].*;
+            const v_i32: @Vector(8, i32) = v_i16;
+            const v_f32: @Vector(8, f32) = @floatFromInt(v_i32);
+            const q_v: @Vector(8, f32) = @splat(q_f32[d]);
+            const diff = v_f32 - q_v;
+            sum_lo = @mulAdd(@Vector(8, f32), diff, diff, sum_lo);
+        }
+
+        // Partial threshold rejection
         const thr: f32 = @floatFromInt(top.distances[top.worst]);
-        const thr_v: @Vector(8, f32) = @splat(thr);
+        const lt_mask = sum_lo < @as(@Vector(8, f32), @splat(thr));
+        if (!@reduce(.Or, lt_mask)) continue;
 
-        // Stage 1: dims 0..4 — FMA com acumulador f32×8
-        var sum: @Vector(8, f32) = @splat(0);
-        inline for (0..4) |d| {
-            const slot = block_ptr + d * ivf.BlockSize;
-            const v_i16: @Vector(8, i16) = slot[0..8].*;
-            const v_i32: @Vector(8, i32) = v_i16;
-            const v_f32: @Vector(8, f32) = @floatFromInt(v_i32);
-            const q_v: @Vector(8, f32) = @splat(q_f32[d]);
-            const diff = v_f32 - q_v;
-            sum = @mulAdd(@Vector(8, f32), diff, diff, sum);
-        }
-        if (!@reduce(.Or, sum < thr_v)) continue;
-
-        // Stage 2: dims 4..6
-        inline for (4..6) |d| {
-            const slot = block_ptr + d * ivf.BlockSize;
-            const v_i16: @Vector(8, i16) = slot[0..8].*;
-            const v_i32: @Vector(8, i32) = v_i16;
-            const v_f32: @Vector(8, f32) = @floatFromInt(v_i32);
-            const q_v: @Vector(8, f32) = @splat(q_f32[d]);
-            const diff = v_f32 - q_v;
-            sum = @mulAdd(@Vector(8, f32), diff, diff, sum);
-        }
-        if (!@reduce(.Or, sum < thr_v)) continue;
-
-        // Stage 3: dims 6..8
-        inline for (6..8) |d| {
-            const slot = block_ptr + d * ivf.BlockSize;
-            const v_i16: @Vector(8, i16) = slot[0..8].*;
-            const v_i32: @Vector(8, i32) = v_i16;
-            const v_f32: @Vector(8, f32) = @floatFromInt(v_i32);
-            const q_v: @Vector(8, f32) = @splat(q_f32[d]);
-            const diff = v_f32 - q_v;
-            sum = @mulAdd(@Vector(8, f32), diff, diff, sum);
-        }
-        if (!@reduce(.Or, sum < thr_v)) continue;
-
-        // Final: dims 8..14 (6 dims).
+        // dims 8..13 (6 dims)
+        var sum_hi: @Vector(8, f32) = @splat(0);
         inline for (8..14) |d| {
             const slot = block_ptr + d * ivf.BlockSize;
             const v_i16: @Vector(8, i16) = slot[0..8].*;
@@ -251,10 +207,11 @@ fn searchClusterBlocks(idx: *const ivf.IvfIndex, c: usize, q: types.QueryI16, to
             const v_f32: @Vector(8, f32) = @floatFromInt(v_i32);
             const q_v: @Vector(8, f32) = @splat(q_f32[d]);
             const diff = v_f32 - q_v;
-            sum = @mulAdd(@Vector(8, f32), diff, diff, sum);
+            sum_hi = @mulAdd(@Vector(8, f32), diff, diff, sum_hi);
         }
 
-        const total_arr: [8]f32 = sum;
+        const total = sum_lo + sum_hi;
+        const total_arr: [8]f32 = total;
         const base_idx = bk * ivf.BlockSize;
         const lane_count = @min(@as(usize, ivf.BlockSize), n_valid - base_idx);
         var j: usize = 0;
@@ -273,17 +230,6 @@ fn searchCluster(idx: *const ivf.IvfIndex, c: usize, q: types.QueryI16, top: *To
 }
 
 pub fn fraudCount(
-    idx: *const ivf.IvfIndex,
-    qF: types.QueryF32,
-    qI: types.QueryI16,
-    cfg: SearchConfig,
-) u8 {
-    // Path novo two-stage: fast_probe > 0 ativa shortlist.
-    if (cfg.fast_probe > 0) return fraudCountShortlist(idx, qF, qI, cfg);
-    return fraudCountLegacy(idx, qF, qI, cfg);
-}
-
-fn fraudCountLegacy(
     idx: *const ivf.IvfIndex,
     qF: types.QueryF32,
     qI: types.QueryI16,
@@ -313,75 +259,6 @@ fn fraudCountLegacy(
                 }
             }
             if (probed) continue;
-            if (bboxMinSqDistance(idx, c, qI) >= threshold) continue;
-            searchCluster(idx, c, qI, &top);
-        }
-        fraud = top.fraudCount();
-    }
-
-    return fraud;
-}
-
-fn fraudCountShortlist(
-    idx: *const ivf.IvfIndex,
-    qF: types.QueryF32,
-    qI: types.QueryI16,
-    cfg: SearchConfig,
-) u8 {
-    const fast: usize = @min(@max(@as(usize, cfg.fast_probe), 1), MaxShortlist);
-    const rescue: usize = @min(@as(usize, cfg.rescue_probe), MaxShortlist - fast);
-    var shortlist_size: usize = @max(@as(usize, cfg.shortlist_size), fast + rescue);
-    shortlist_size = @min(shortlist_size, MaxShortlist);
-
-    var shortlist_buf: [MaxShortlist]usize = undefined;
-    const shortlist = shortlist_buf[0..shortlist_size];
-    nearestCentroids(idx, qF, shortlist_size, shortlist);
-
-    var top = Top5{};
-
-    // Fast pass: probe shortlist[0..fast].
-    for (shortlist[0..fast]) |c| {
-        if (c != std.math.maxInt(usize)) searchCluster(idx, c, qI, &top);
-    }
-
-    var fraud = top.fraudCount();
-
-    // Reprobe seletivo: shortlist[fast..fast+rescue].
-    // Gating principal: per-class worst-distance threshold (calibrado offline).
-    // Fallback: janela ambígua cardinal (ambig_min..ambig_max).
-    if (rescue > 0) {
-        const worst_dist = top.distances[top.worst];
-        const has_thr = blk: {
-            inline for (cfg.extreme_thresholds) |t| if (t != 0) break :blk true;
-            break :blk false;
-        };
-        const should_reprobe = if (has_thr)
-            worst_dist >= cfg.extreme_thresholds[fraud]
-        else
-            (fraud >= cfg.ambig_min and fraud <= cfg.ambig_max);
-
-        if (should_reprobe) {
-            for (shortlist[fast .. fast + rescue]) |c| {
-                if (c != std.math.maxInt(usize)) searchCluster(idx, c, qI, &top);
-            }
-            fraud = top.fraudCount();
-        }
-    }
-
-    // Fallback bbox repair opcional, após reprobe seletivo.
-    if (cfg.bbox_repair and fraud >= cfg.repair_min and fraud <= cfg.repair_max) {
-        const threshold = top.distances[top.worst];
-        const probed = shortlist[0 .. fast + rescue];
-        var c: usize = 0;
-        while (c < idx.n_clusters) : (c += 1) {
-            var already = false;
-            for (probed) |p| {
-                if (p == c) {
-                    already = true;
-                    break;
-                }
-            }
-            if (already) continue;
             if (bboxMinSqDistance(idx, c, qI) >= threshold) continue;
             searchCluster(idx, c, qI, &top);
         }

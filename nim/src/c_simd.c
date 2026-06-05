@@ -1,15 +1,18 @@
-/* Distância euclidiana² em SoA per-cluster com AVX2.
+/* Distância euclidiana² em SoA per-cluster com AVX2 + PMADDWD.
  *
  * vec_soa layout (per cluster, N candidatos):
  *   dim0[0..N-1], dim1[0..N-1], ..., dim13[0..N-1]   (int16, contíguo)
  *
  * Saída: dists_out[i] = sum_d (vec[i][d] - q[d])², em int64.
  *
+ * Estratégia PMADDWD: par de dims processado em 1 instrução. Loads 2× i16x8,
+ * unpack pra (d,d+1,d,d+1,...), sub i16, madd_epi16(diff,diff) → i32×8 com
+ * (v0-q0)² + (v1-q1)² por lane.
+ *
  * Overflow analysis (max_diff = ~20000 → max_sq = 4e8):
- *   - 4 dims acumulados → 1.6e9 < INT32_MAX (2.15e9) ✓
- *   - 5+ dims acumulados → estoura int32
- * Solução: 4 acumuladores int32 paralelos, cada um com no máximo 4 dims;
- * depois soma em int64.
+ *   - madd somma 2 pares por lane = 8e8 max (cabe i32, 2.15e9)
+ *   - 4 dims acumulados = 2 madds = 1.6e9 < INT32_MAX ✓
+ * Mantém 4 acumuladores int32, cada um com até 4 dims (2 iter madd); soma final em int64.
  */
 
 #include <stdint.h>
@@ -24,7 +27,25 @@ static inline __m256i sq_chunk_8(const int16_t* vec_soa, int32_t N, int32_t i,
                                  const int16_t* q, int dim_start, int dim_end)
 {
     __m256i acc = _mm256_setzero_si256();
-    for (int d = dim_start; d < dim_end; d++) {
+    int d = dim_start;
+    /* Pares: 1 madd cobre 2 dims, lane j = (v[d]-q[d])² + (v[d+1]-q[d+1])². */
+    for (; d + 1 < dim_end; d += 2) {
+        __m128i v0 = _mm_loadu_si128((const __m128i*)(vec_soa + (int64_t)d*N + i));
+        __m128i v1 = _mm_loadu_si128((const __m128i*)(vec_soa + (int64_t)(d+1)*N + i));
+        /* Interleave (d,d+1) por lane → pares contíguos pro PMADDWD. */
+        __m128i lo = _mm_unpacklo_epi16(v0, v1); /* [v0_0,v1_0,...,v0_3,v1_3] */
+        __m128i hi = _mm_unpackhi_epi16(v0, v1); /* [v0_4,v1_4,...,v0_7,v1_7] */
+        __m256i pairs = _mm256_set_m128i(hi, lo);
+        /* Broadcast q[d],q[d+1] como i32 lanes = (uint16)q[d] | ((uint16)q[d+1] << 16). */
+        int32_t q_pack = ((int32_t)(uint16_t)q[d])
+                       | (((int32_t)(uint16_t)q[d+1]) << 16);
+        __m256i q_b  = _mm256_set1_epi32(q_pack);
+        __m256i diff = _mm256_sub_epi16(pairs, q_b);
+        __m256i sq   = _mm256_madd_epi16(diff, diff);
+        acc = _mm256_add_epi32(acc, sq);
+    }
+    /* Dim sobrando (chunk ímpar): fallback escalar→vetor via cvt+mullo. */
+    for (; d < dim_end; d++) {
         __m128i v16  = _mm_loadu_si128((const __m128i*)(vec_soa + (int64_t)d*N + i));
         __m256i v32  = _mm256_cvtepi16_epi32(v16);
         __m256i q32  = _mm256_set1_epi32((int32_t)q[d]);

@@ -507,3 +507,52 @@ c. **Voltar pra Zig v8 path**: padrão silent-index (C++ AVX2 + custom LB fd-pas
 - `nim/src/c_simd.c` master commit (PMADDWD impl — código intacto, imagem `:v11` no GHCR não usada)
 - Submission compose em `v10` + cleaned (sem `security_opt`/`sysctls`)
 - `:v10` imagem permanece como baseline de Nim
+
+## Encerramento (2026-06-05) — aprendizados consolidados
+
+### Decisão: abandonar otimização ativa
+
+Posição final: **#66/332** com `lemesdaniel-nim` v10 5552 / p99 1.85ms.
+
+Top1 agora tem 15+ empatados em 6000 com p99 < 0.5ms (rafaelcoelhox 0.29ms, chrisamora-c 0.31ms, bmtec-c 0.34ms, etc) — onda grande de submissões nas últimas semanas saturou cap p99_score. Gap nosso → top1: ~450 pts (300 do det penalty + 150 do p99 gap).
+
+### Aprendizados-chave da sessão
+
+1. **PMADDWD em layout SoA não compensa**.
+   - Test local (1500 vecs, edge cases) deu 0 mismatches mas prod deu 10 erros (8 FP + 2 FN) em 54100. Test sintético uniform random NÃO cobre distribuição real do `references.json.gz`.
+   - p99 piorou +0.14ms — overhead `unpacklo/hi_epi16` + `vinserti128` por iter anula vantagem latência `vpmaddwd` (lat 5) vs `vpmulld` (lat 10).
+   - Padrão real top (silent-index, jrblatt): layout pair-interleaved feito 1× no preprocessing. SoA-as-is + PMADDWD pega o pior dos dois mundos.
+
+2. **Regras compose mudaram silenciosamente**.
+   - Harness agora rejeita `security_opt: seccomp=unconfined` e `sysctls: net.core.somaxconn`. Submissions antigas grandfathered (scores históricos preservados), mas qualquer push novo precisa compose limpo.
+   - Sem `sysctls` o kernel default `somaxconn` (128 em container default) limita backlog kernel mesmo com `listen 9999 backlog=4096` no nginx → spike concorrente enfileira. Custo medido: **~250 pts** (5802→5552 sem mudar código).
+   - Re-confirmar regra antes de qualquer ranking future-proof.
+
+3. **Rosetta arm64→amd64 não mede AVX2 performance**.
+   - Tradução NEON falsifica latência/throughput de instruções vetoriais.
+   - Sempre que medição AVX2 importar: usar runner amd64 nativo (GitHub Actions x86_64 runner, ou VM Linux real). Não confiar em bench local Mac M-series sob Docker amd64.
+
+4. **Variance harness ±100 pts segue válida**.
+   - Re-bench v10 sob compose limpo: 5552 vs ~5550 esperado (única mudança = sysctls drop). Variance comportada.
+
+5. **Test correctness offline com dataset real é pré-requisito** pra qualquer mudança em search.
+   - Próxima evolução: bench Python que carrega `references.json.gz` + replay queries fixas + compara distâncias contra impl atual. Sem isso, cada experimento custa 1 submission (~15min) e queima ranking público.
+
+### Caminhos descartados nesta sessão
+
+- ❌ PMADDWD sem relayout (regrediu p99 + det)
+- ❌ Nginx tuning extra (config já no teto razoável: `backlog=4096`, `reuseport`, `multi_accept`, `epoll`)
+- ❌ Submissão exploratória sem bench offline
+
+### Caminhos preservados pra eventual retomada
+
+a. **PMADDWD + relayout pair-interleaved** no `build_index_only.py` + `ivf.nim` reader (~60 LOC). Elimina unpack runtime, custo amortizado no preproc.
+b. **SCM_RIGHTS LB custom em Zig** (padrão silent-index/jrblatt). Elimina nginx middlepoint, ganho histórico estimado 200-400 pts. Alto LOC, alto risco.
+c. **Bench offline Python** com seed fixa replay sobre references real → calibra threshold, mede det/p99 isolado, sem custar submission.
+
+### Estado final do repositório
+
+- `nim/src/c_simd.c` master: contém impl PMADDWD (não revertida — preservada como referência code, fácil rollback `git revert`).
+- `:v11` imagem GHCR: preservada (rollback fácil se debug futuro).
+- Submission branch: aponta `:v10` + compose limpo. Score público estável.
+- `JOURNEY.md`: este arquivo, source-of-truth dos experimentos.

@@ -37,7 +37,9 @@
     // internet connectivity.
     .dependencies = .{
         .httpz = .{
-            .path = "vendor/httpz",
+            // vendor 0.15 puro extraído do commit v8 (740f78b).
+            // vendor/httpz = upstream 0.16 (regrediu, v22); httpz.bak = contaminado com @Tuple.
+            .path = "vendor/httpz015",
         },
     },
     .paths = .{

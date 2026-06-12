@@ -45,12 +45,17 @@ LABEL org.opencontainers.image.licenses="MIT"
 WORKDIR /app
 
 COPY zig/zig-out/bin/floating_finch_zig /app/floating_finch_zig
+COPY zig/zig-out/bin/floating_finch_lb /app/floating_finch_lb
+COPY zig/zig-out/bin/floating_finch_api /app/floating_finch_api
 COPY --from=preproc /work/data/index.bin /app/data/index.bin
 
 ENV INDEX_PATH=/app/data/index.bin
 ENV BIND_HOST=0.0.0.0
 ENV BIND_PORT=8080
 
-EXPOSE 8080
+EXPOSE 8080 9999
 
-ENTRYPOINT ["/app/floating_finch_zig"]
+# ROLE escolhe binário: lb | api | httpz (default httpz = comportamento v8)
+COPY docker/entrypoint-zig.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
+ENTRYPOINT ["/app/entrypoint.sh"]

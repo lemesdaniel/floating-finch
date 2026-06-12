@@ -26,6 +26,32 @@ pub fn build(b: *std.Build) void {
         b.installArtifact(exe);
     }
 
+    // LB SCM_RIGHTS fd-passing
+    {
+        const m = b.createModule(.{
+            .root_source_file = b.path("src/main_lb.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .single_threaded = true,
+        });
+        const exe = b.addExecutable(.{ .name = "floating_finch_lb", .root_module = m });
+        b.installArtifact(exe);
+    }
+
+    // API multi-worker epoll que adota fds via SCM_RIGHTS
+    {
+        const m = b.createModule(.{
+            .root_source_file = b.path("src/main_api.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+            .single_threaded = false,
+        });
+        const exe = b.addExecutable(.{ .name = "floating_finch_api", .root_module = m });
+        b.installArtifact(exe);
+    }
+
     // Binários alternativos (epoll/io_uring) habilitam com -Dwith-alts=true
     const with_alts = b.option(bool, "with-alts", "Build epoll/io_uring alternatives") orelse false;
     if (with_alts) {

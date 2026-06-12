@@ -1,0 +1,66 @@
+services:
+  lb:
+    image: floating-finch-zig:lb-local
+    depends_on: [api1, api2]
+    networks: [backend]
+    ports:
+      - "9999:9999"
+    environment:
+      ROLE: lb
+      BIND_PORT: "9999"
+      API_SOCKETS: /sockets/api1.sock,/sockets/api2.sock
+      LB_CONNS_PER_API: "2"
+    volumes:
+      - sockets:/sockets
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    deploy:
+      resources:
+        limits:
+          cpus: "0.10"
+          memory: "20MB"
+
+  api1: &api
+    image: floating-finch-zig:lb-local
+    networks: [backend]
+    environment:
+      ROLE: api
+      INDEX_PATH: /app/data/index.bin
+      UDS_PATH: /sockets/api1.sock
+      API_WORKERS: "2"
+      IVF_NPROBE: "4"
+      IVF_BBOX_REPAIR: "true"
+      IVF_REPAIR_MIN: "1"
+      IVF_REPAIR_MAX: "4"
+    volumes:
+      - sockets:/sockets
+    ulimits:
+      nofile:
+        soft: 65535
+        hard: 65535
+    deploy:
+      resources:
+        limits:
+          cpus: "0.45"
+          memory: "165MB"
+
+  api2:
+    <<: *api
+    environment:
+      ROLE: api
+      INDEX_PATH: /app/data/index.bin
+      UDS_PATH: /sockets/api2.sock
+      API_WORKERS: "2"
+      IVF_NPROBE: "4"
+      IVF_BBOX_REPAIR: "true"
+      IVF_REPAIR_MIN: "1"
+      IVF_REPAIR_MAX: "4"
+
+volumes:
+  sockets:
+
+networks:
+  backend:
+    driver: bridge

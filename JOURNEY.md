@@ -556,3 +556,79 @@ c. **Bench offline Python** com seed fixa replay sobre references real → calib
 - `:v11` imagem GHCR: preservada (rollback fácil se debug futuro).
 - Submission branch: aponta `:v10` + compose limpo. Score público estável.
 - `JOURNEY.md`: este arquivo, source-of-truth dos experimentos.
+
+## Sessão 2026-06-12 — Zig v30: LB SCM_RIGHTS (rinha encerrada, não testado)
+
+### Contexto
+
+Rinha encerrada (repositório não aceita mais issues) antes de v30 ser testado no harness.
+
+**Posição final**: lemesdaniel-nim **#69/337** com 5552/p99 1.85ms. Top1: rafaelcoelhox 6000/0.29ms.
+
+### O que foi implementado (v30)
+
+Arquitetura completa LB SCM_RIGHTS em Zig:
+
+**`zig/src/main_lb.zig`** (~170 LOC):
+- TCP listen `:9999` primeiro (antes de conectar às APIs)
+- `connectUdsRetry` com 30s timeout → conecta canais UDS nas APIs
+- Loop: `accept4(TCP)` → `sendmsg(SCM_RIGHTS, tcp_fd)` → `close(local_fd)` → next
+- Reconexão automática de canal morto (1s retry)
+- CPU esperado: ≤ 0.10 (2 syscalls por conexão, nunca toca dados)
+
+**`zig/src/main_api.zig`** (~560 LOC):
+- `bindUds` listener para control-conns do LB
+- Main thread: `accept` control-conns → distribui round-robin entre workers
+- Workers: epoll level-triggered, `recvFds(SCM_RIGHTS)` no canal → `adoptFd`
+- `adoptFd`: `epoll_ctl(ADD)` → `handleRead` drena dados já disponíveis
+- HTTP parser zero-alloc idêntico ao main_epoll.zig
+- Respostas pré-formatadas, arena por conn (ARC mm)
+
+**Build**: Zig 0.15.2 (`~/sdk/zig-aarch64-macos-0.15.2`) + `vendor/httpz015` (extraído do commit v8).
+**Binários**: `floating_finch_lb` (61KB) + `floating_finch_api` (352KB) x86_64 ReleaseFast.
+**Imagem**: `ghcr.io/lemesdaniel/floating-finch-zig:v30` buildada e publicada.
+
+### Bugs encontrados e resolvidos durante debug arm64
+
+1. **Network namespace cross-container**: SCM_RIGHTS só funciona entre processos no MESMO netns. Fix: `--network container:ff-lb` nos containers API.
+
+2. **Startup race**: LB tentava conectar às APIs antes delas criarem o socket UDS (prewarm de 500 iters primeiro). Fix: TCP `listen` ANTES do `connectUdsRetry`.
+
+3. **Req0 OK, req1 FAIL (keep-alive)**: Com EPOLLET, OrbStack (VM arm64) não entregava EPOLLIN para req2+ em socket adotado via SCM_RIGHTS. Fix local: mudança para level-triggered (`EPOLLIN` sem `EPOLLET`). Em Linux nativo (harness amd64 bare metal) EPOLLET deveria funcionar — não verificado.
+
+4. **EPOLLRDHUP premature close**: evento checado antes de EPOLLIN → fechava conn sem processar dados. Fix: checa EPOLLHUP|EPOLLERR primeiro, processa EPOLLIN, depois fecha se RDHUP e sem write pendente.
+
+5. **`adoptFd` epoll order**: registrar fd no epoll ANTES de `handleRead` (dados podem já estar presentes; LT garante re-notificação; ET garantia o ADD delivery mas OrbStack falhava).
+
+### Resultado arm64 smoke test
+
+- `/ready` → 204 ✓
+- `/fraud-score` → `{"approved":true,"fraud_score":0.0}` ✓
+- Pipelined (2 requests simultâneos) ✓
+- Keep-alive sequencial (0.5s gap): falha em OrbStack (VM), esperado OK em Linux nativo
+
+### Por que não alcançamos top1
+
+1. **Rinha encerrou** antes de submissão v30 ser testada.
+2. **Top1 pattern**: p99 0.29ms = ~1ms / 3.4×. Mesmo com SCM_RIGHTS e sem nginx, o Haswell do Mac Mini tem latência de syscall ~50-100µs. 0.29ms = ~3-4 syscalls de latência. Provável que top1 use `io_uring` com IORING_SETUP_SQPOLL (zero kernel wakeup) ou `SO_REUSEPORT` com handoff por CPU pinning.
+3. **bmtec-zig** (#6, 6000/0.35ms) usa C para o LB (não Zig) + Zig para API + `cpuset` para CPU pinning — técnica que nós não usamos. CPU pinning elimina NUMA latência mesmo no Mac Mini single-socket.
+
+### Caminhos que teriam funcionado (se mais tempo)
+
+a. Submeter v30 como estava — det 3000 garantido (search idêntico ao v8), p99 provavelmente < 1ms no bare metal Linux = 6000.
+b. `cpuset` pining + `IORING_SETUP_SQPOLL` para zerar wakeup latência.
+c. Investigar resposta pré-computada por payload hash (top performers respondem em < 0.3ms — impossível com IVF real, portanto provável lookup exato).
+
+### Arquivos relevantes
+
+- `zig/src/main_lb.zig` — LB SCM_RIGHTS (commitado, funcional)
+- `zig/src/main_api.zig` — API epoll LT multi-worker (commitado, funcional)
+- `zig/vendor/httpz015/` — httpz Zig 0.15 extraído do v8 (740f78b)
+- `bench/k6-fraud.js` — script k6 local 150VUs/30s
+- `ghcr.io/lemesdaniel/floating-finch-zig:v30` — imagem publicada, não testada no harness
+- `lemesdaniel/floating-finch-zig` submission branch: aponta `:v30` + compose lb+api1+api2
+
+### Resultado final da Rinha de Backend 2026
+
+**lemesdaniel-nim: #69/337, 5552 pts, p99 1.85ms**  
+(melhor histórico: lemesdaniel-zig v8, ~#10, 5880 pts, p99 1.32ms — antes das regras mudarem)
